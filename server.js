@@ -1,786 +1,423 @@
-// ============================================================
-// TELEGRAM CLICK PAYMENT BOT
-// FAQAT 412 000 SO'M TO'LOVNI TASDIQLAYDI
-// ============================================================
-
-const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const TelegramBot = require('node-telegram-bot-api');
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
+const TelegramBot = require("node-telegram-bot-api");
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// ============================================================
+// =====================================================
 // SOZLAMALAR
-// ============================================================
+// =====================================================
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const ALLOWED_CHAT_ID = String(process.env.CLICK_GROUP_CHAT_ID || '');
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const ALLOWED_CHAT_ID = String(
+  process.env.CLICK_GROUP_CHAT_ID || ""
+);
 
+// FAQAT SHU SUMMA QABUL QILINADI
 const EXPECTED_AMOUNT = 412000;
 
 // To'lovlar saqlanadigan fayl
-const DB_FILE = path.join(__dirname, 'payments.json');
+const DB_FILE = path.join(__dirname, "payments.json");
 
-// Render porti
+// Render port
 const PORT = process.env.PORT || 3000;
 
 
-// ============================================================
-// TOKEN TEKSHIRISH
-// ============================================================
-
-if (!BOT_TOKEN) {
-    console.error('❌ TELEGRAM_BOT_TOKEN topilmadi!');
-    process.exit(1);
-}
-
-if (!ALLOWED_CHAT_ID) {
-    console.error('❌ CLICK_GROUP_CHAT_ID topilmadi!');
-    process.exit(1);
-}
-
-
-// ============================================================
+// =====================================================
 // DATABASE
-// ============================================================
+// =====================================================
 
-function loadDb() {
-    try {
-        if (!fs.existsSync(DB_FILE)) {
-            return {
-                payments: []
-            };
-        }
-
-        const data = JSON.parse(
-            fs.readFileSync(DB_FILE, 'utf8')
-        );
-
-        if (!data.payments || !Array.isArray(data.payments)) {
-            return {
-                payments: []
-            };
-        }
-
-        return data;
-
-    } catch (error) {
-        console.error('❌ DB o‘qishda xato:', error.message);
-
-        return {
-            payments: []
-        };
+function loadPayments() {
+  try {
+    if (!fs.existsSync(DB_FILE)) {
+      return [];
     }
+
+    const data = fs.readFileSync(DB_FILE, "utf8");
+
+    if (!data.trim()) {
+      return [];
+    }
+
+    return JSON.parse(data);
+  } catch (error) {
+    console.error("Database o'qishda xato:", error);
+    return [];
+  }
+}
+
+function savePayments(payments) {
+  try {
+    fs.writeFileSync(
+      DB_FILE,
+      JSON.stringify(payments, null, 2),
+      "utf8"
+    );
+  } catch (error) {
+    console.error("Database saqlashda xato:", error);
+  }
 }
 
 
-function saveDb(db) {
-    try {
-        fs.writeFileSync(
-            DB_FILE,
-            JSON.stringify(db, null, 2),
-            'utf8'
-        );
-    } catch (error) {
-        console.error('❌ DB saqlashda xato:', error.message);
-    }
+// =====================================================
+// SUMMANI ANIQLASH
+// =====================================================
+
+function normalizeText(text) {
+  return String(text || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/[₽$€]/g, "")
+    .replace(/,/g, " ")
+    .trim();
 }
 
-
-// ============================================================
-// SUMMANI TOZALASH
-// ============================================================
-
-// Masalan:
-// "412 000"  -> 412000
-// "412,000"  -> 412000
-// "412.000"  -> 412000
-// "412000"   -> 412000
-
-function normalizeAmount(value) {
-    if (value === null || value === undefined) {
-        return null;
-    }
-
-    const digits = String(value).replace(/[^\d]/g, '');
-
-    if (!digits) {
-        return null;
-    }
-
-    const amount = Number(digits);
-
-    if (!Number.isFinite(amount)) {
-        return null;
-    }
-
-    return amount;
-}
-
-
-// ============================================================
-// CLICK XABARIDAN SUMMANI TOPISH
-// ============================================================
 
 function extractAmount(text) {
+  const normalized = normalizeText(text);
 
-    if (!text) {
-        return null;
-    }
+  /*
+    Quyidagilarning barchasi 412000 deb olinadi:
 
-    const normalizedText = String(text)
-        .replace(/\u00A0/g, ' ')
-        .replace(/₽/g, ' ')
-        .trim();
+    412000
+    412 000
+    412 000 so'm
+    412 000 сўм
+    412 000 сум
+    412000 so'm
+  */
 
+  const matches = normalized.match(/\b\d{1,3}(?:[\s.]?\d{3})+\b|\b\d{4,7}\b/g);
 
-    // --------------------------------------------------------
-    // 1. AVVAL "SUMMA" QATORINI QIDIRAMIZ
-    // --------------------------------------------------------
-
-    const lines = normalizedText
-        .split('\n')
-        .map(line => line.trim())
-        .filter(Boolean);
-
-
-    for (const line of lines) {
-
-        // Faqat summa/to'lov/mablag' kabi qatorlardan izlaymiz
-        const isAmountLine =
-            /(?:summa|сумма|to.?lov|tolov|төлов|mablag|маблаг|amount|click)/i.test(line) ||
-            /(?:💰|💵|💳)/u.test(line);
-
-        if (!isAmountLine) {
-            continue;
-        }
-
-
-        // 412 000 so'm
-        // 412000 so'm
-        // 412,000 сум
-        // 412.000 сум
-        const match = line.match(
-            /(\d{1,3}(?:[\s.,]\d{3})+|\d{4,})(?:\s*(?:so.?m|sum|сум|сўм|uzs))?/iu
-        );
-
-        if (match) {
-
-            const amount = normalizeAmount(match[1]);
-
-            if (amount !== null) {
-                return amount;
-            }
-        }
-    }
-
-
-    // --------------------------------------------------------
-    // 2. AGAR YUQORIDAGI USUL TOPMASA,
-    //    FAQAT VALYUTA BILAN YOZILGAN SUMMANI QIDIRAMIZ
-    // --------------------------------------------------------
-
-    const currencyMatches = normalizedText.matchAll(
-        /(\d{1,3}(?:[\s.,]\d{3})+|\d{4,})\s*(?:so.?m|sum|сум|сўм|uzs)\b/giu
-    );
-
-    for (const match of currencyMatches) {
-
-        const amount = normalizeAmount(match[1]);
-
-        if (amount !== null) {
-            return amount;
-        }
-    }
-
-
+  if (!matches) {
     return null;
-}
+  }
 
-
-// ============================================================
-// CLICK XABARINI TEKSHIRISH
-// ============================================================
-
-function isSuccessfulClickPayment(text) {
-
-    if (!text) {
-        return false;
-    }
-
-    const lower = String(text).toLowerCase();
-
-
-    // Click muvaffaqiyatli to'lov xabarlarida
-    // quyidagi iboralardan biri bo'lishi kerak.
-
-    const successWords = [
-        'muvaffaqiyatli tasdiqlandi',
-        'успешно подтвержден',
-        'успешно подтверждено',
-        'successful',
-        'successfully',
-        'muvaffaqiyatli'
-    ];
-
-    const hasSuccessWord = successWords.some(word =>
-        lower.includes(word)
+  for (const item of matches) {
+    const number = Number(
+      item
+        .replace(/\s/g, "")
+        .replace(/\./g, "")
     );
 
-
-    if (!hasSuccessWord) {
-        return false;
+    if (!Number.isNaN(number)) {
+      return number;
     }
+  }
 
-
-    // Faqat 412000
-    const amount = extractAmount(text);
-
-    if (amount !== EXPECTED_AMOUNT) {
-        return false;
-    }
-
-
-    return true;
+  return null;
 }
 
 
-// ============================================================
-// REF / TELEFON / ID TOPISH
-// ============================================================
+// =====================================================
+// TELEFON / REF ANIQLASH
+// =====================================================
+
+function extractPhone(text) {
+  const matches = String(text || "").match(/\+?\d[\d\s()-]{7,18}\d/g);
+
+  if (!matches) {
+    return null;
+  }
+
+  return matches[0]
+    .replace(/[^\d+]/g, "")
+    .trim();
+}
+
 
 function extractReference(text) {
+  const normalized = String(text || "");
 
-    if (!text) {
-        return null;
-    }
+  // REF: +998...
+  const refMatch = normalized.match(
+    /(?:REF|ref|ID|id)\s*[:#-]?\s*([+\d][\d\s()-]{5,25})/
+  );
 
+  if (refMatch) {
+    return refMatch[1]
+      .replace(/[^\d+]/g, "")
+      .trim();
+  }
 
-    // Telefon raqam
-    const phoneMatch = text.match(
-        /(?:\+998|998)\s*[\d\s\-()]{9,}/
-    );
-
-    if (phoneMatch) {
-
-        const phone = phoneMatch[0]
-            .replace(/[^\d+]/g, '');
-
-        return phone;
-    }
-
-
-    // ID
-    const idMatch = text.match(
-        /(?:id|ID|🆔)\s*[:\-]?\s*(\d{5,})/u
-    );
-
-    if (idMatch) {
-        return idMatch[1];
-    }
-
-
-    return null;
+  // Telefon raqam bo'lsa
+  return extractPhone(normalized);
 }
 
 
-// ============================================================
-// CLICK XABARINI TAHLIL QILISH
-// ============================================================
+// =====================================================
+// TO'LOVNI TEKSHIRISH
+// =====================================================
 
-function parseClickMessage(text) {
+function registerPayment(messageText, messageId, chatId) {
+  const text = String(messageText || "");
 
-    if (!text) {
-        return null;
-    }
+  const amount = extractAmount(text);
 
+  console.log("======================================");
+  console.log("Xabar matni:");
+  console.log(text);
+  console.log("Aniqlangan summa:", amount);
 
-    // Faqat muvaffaqiyatli to'lov
-    if (!isSuccessfulClickPayment(text)) {
-        return null;
-    }
-
-
-    const amount = extractAmount(text);
-
-    // Juda muhim:
-    // summa AYNAN 412000 bo'lishi kerak.
-    if (amount !== EXPECTED_AMOUNT) {
-        return null;
-    }
-
-
-    const ref = extractReference(text);
-
+  // 412 000 BO'LMASA — TO'LOV HISOBLANMAYDI
+  if (amount !== EXPECTED_AMOUNT) {
+    console.log("❌ To'lov tasdiqlanmadi.");
+    console.log("Sabab: summa 412 000 emas.");
+    console.log("======================================");
 
     return {
-        ref: ref,
-        amount: amount,
-        currency: 'UZS',
-        status: 'paid',
-        originalText: text
+      success: false,
+      reason: "WRONG_AMOUNT",
+      amount
     };
+  }
+
+  const reference = extractReference(text);
+
+  if (!reference) {
+    console.log("❌ REF/telefon topilmadi.");
+
+    return {
+      success: false,
+      reason: "NO_REFERENCE",
+      amount
+    };
+  }
+
+  const payments = loadPayments();
+
+  // Bir xil REF qayta kelgan bo'lsa ikkinchi marta ochilmaydi
+  const alreadyPaid = payments.find(
+    p => p.reference === reference
+  );
+
+  if (alreadyPaid) {
+    console.log("⚠️ Bu REF oldin to'langan.");
+
+    return {
+      success: true,
+      alreadyPaid: true,
+      payment: alreadyPaid
+    };
+  }
+
+  const payment = {
+    id: Date.now().toString(),
+    reference,
+    amount: EXPECTED_AMOUNT,
+    status: "paid",
+    chatId: String(chatId),
+    messageId: String(messageId),
+    paidAt: new Date().toISOString(),
+    testAccess: true
+  };
+
+  payments.push(payment);
+  savePayments(payments);
+
+  console.log("✅ 412 000 SO'M TO'LOV TASDIQLANDI");
+  console.log("REF:", reference);
+  console.log("TEST OCHILDI");
+  console.log("======================================");
+
+  return {
+    success: true,
+    alreadyPaid: false,
+    payment
+  };
 }
 
 
-// ============================================================
-// DATABASE'DA DUPLIKATNI TEKSHIRISH
-// ============================================================
-
-function paymentAlreadyExists(db, payment, message) {
-
-    // Telegram message ID orqali tekshirish
-    if (
-        message &&
-        message.chat &&
-        message.message_id
-    ) {
-
-        const existsByMessageId = db.payments.find(item =>
-            item.chatId === String(message.chat.id) &&
-            item.messageId === message.message_id
-        );
-
-        if (existsByMessageId) {
-            return true;
-        }
-    }
-
-
-    // Agar telefon/ref bo'lsa,
-    // bir xil ref bilan oldin to'lov o'tganini tekshiramiz.
-    if (payment.ref) {
-
-        const existsByRef = db.payments.find(item =>
-            item.ref === payment.ref &&
-            item.amount === EXPECTED_AMOUNT &&
-            item.status === 'paid'
-        );
-
-        if (existsByRef) {
-            return true;
-        }
-    }
-
-
-    return false;
-}
-
-
-// ============================================================
+// =====================================================
 // TELEGRAM BOT
-// ============================================================
+// =====================================================
 
-const bot = new TelegramBot(
-    BOT_TOKEN,
-    {
-        polling: true
+let bot = null;
+
+if (BOT_TOKEN) {
+  bot = new TelegramBot(BOT_TOKEN, {
+    polling: true
+  });
+
+  console.log("Telegram bot ishga tushdi.");
+
+  bot.on("message", async (msg) => {
+    try {
+      const chatId = String(msg.chat.id);
+      const text = msg.text || msg.caption || "";
+
+      console.log("");
+      console.log("📩 Yangi Telegram xabar");
+      console.log("Chat ID:", chatId);
+      console.log("Title:", msg.chat.title || "");
+      console.log("Text:", text);
+
+      // Faqat belgilangan Click guruhidan
+      if (
+        ALLOWED_CHAT_ID &&
+        chatId !== ALLOWED_CHAT_ID
+      ) {
+        console.log("⛔ Boshqa chat. E'tiborsiz qoldirildi.");
+        return;
+      }
+
+      const result = registerPayment(
+        text,
+        msg.message_id,
+        chatId
+      );
+
+      // Faqat REAL 412 000 to'lov bo'lsa javob
+      if (result.success && result.payment) {
+        try {
+          await bot.sendMessage(
+            msg.chat.id,
+            "✅ TO'LOV TASDIQLANDI\n\n" +
+            "💰 Summa: 412 000 so'm\n" +
+            "🟢 Testga kirish ochildi.\n" +
+            "🆔 REF: " + result.payment.reference
+          );
+        } catch (sendError) {
+          console.error(
+            "Telegram javob yuborishda xato:",
+            sendError.message
+          );
+        }
+      }
+
+    } catch (error) {
+      console.error(
+        "Telegram message error:",
+        error
+      );
     }
-);
+  });
 
-
-// ============================================================
-// TELEGRAM XATOLAR
-// ============================================================
-
-bot.on('polling_error', (error) => {
-
+  bot.on("polling_error", (error) => {
     console.error(
-        '❌ TELEGRAM POLLING ERROR:',
-        error.response?.body || error.message
+      "Telegram polling error:",
+      error.message
     );
+  });
 
+} else {
+  console.log(
+    "⚠️ TELEGRAM_BOT_TOKEN mavjud emas."
+  );
+}
+
+
+// =====================================================
+// API
+// =====================================================
+
+// Server ishlayotganini tekshirish
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "telegram-click-payment-bot",
+    requiredAmount: EXPECTED_AMOUNT,
+    currency: "UZS"
+  });
 });
 
 
-// ============================================================
-// HAR BIR TELEGRAM XABARINI QABUL QILISH
-// ============================================================
-
-bot.on('message', async (msg) => {
-
-    try {
-
-        // Chat ID
-        const chatId = String(msg.chat.id);
-
-        // Chat nomi
-        const chatTitle = msg.chat.title || msg.chat.username || '';
-
-
-        console.log(
-            '📩 Xabar keldi:',
-            'chat_id =',
-            chatId,
-            '|',
-            'title =',
-            chatTitle
-        );
-
-
-        // ----------------------------------------------------
-        // FAQAT KERAKLI GROUP'DAN XABAR QABUL QILAMIZ
-        // ----------------------------------------------------
-
-        if (chatId !== ALLOWED_CHAT_ID) {
-
-            console.log(
-                '⚠️ Boshqa chat. O‘tkazib yuborildi:',
-                chatId
-            );
-
-            return;
-        }
-
-
-        // ----------------------------------------------------
-        // MATN
-        // ----------------------------------------------------
-
-        const text = msg.text || msg.caption || '';
-
-
-        if (!text) {
-            return;
-        }
-
-
-        console.log('📝 Xabar matni:');
-        console.log(text);
-
-
-        // ----------------------------------------------------
-        // CLICK XABARINI TAHLIL QILAMIZ
-        // ----------------------------------------------------
-
-        const payment = parseClickMessage(text);
-
-
-        // Oddiy xabar yoki noto'g'ri summa
-        if (!payment) {
-
-            console.log(
-                '❌ To‘lov tasdiqlanmadi.'
-            );
-
-            return;
-        }
-
-
-        console.log(
-            '💰 Aniqlangan summa:',
-            payment.amount
-        );
-
-
-        // ----------------------------------------------------
-        // DATABASE
-        // ----------------------------------------------------
-
-        const db = loadDb();
-
-
-        // ----------------------------------------------------
-        // DUPLIKAT
-        // ----------------------------------------------------
-
-        if (paymentAlreadyExists(db, payment, msg)) {
-
-            console.log(
-                '⚠️ Bu to‘lov oldin hisoblangan.'
-            );
-
-            return;
-        }
-
-
-        // ----------------------------------------------------
-        // TO‘LOVNI SAQLAYMIZ
-        // ----------------------------------------------------
-
-        const record = {
-
-            id: Date.now(),
-
-            ref: payment.ref,
-
-            amount: EXPECTED_AMOUNT,
-
-            currency: 'UZS',
-
-            status: 'paid',
-
-            chatId: chatId,
-
-            chatTitle: chatTitle,
-
-            messageId: msg.message_id,
-
-            date: new Date().toISOString(),
-
-            text: text
-        };
-
-
-        db.payments.push(record);
-
-        saveDb(db);
-
-
-        // ----------------------------------------------------
-        // NATIJA
-        // ----------------------------------------------------
-
-        console.log('');
-        console.log('========================================');
-        console.log('✅ TO‘LOV TASDIQLANDI');
-        console.log('💰 SUMMA: 412 000 SO‘M');
-        console.log('📱 REF:', payment.ref || 'topilmadi');
-        console.log('🆔 MESSAGE ID:', msg.message_id);
-        console.log('========================================');
-        console.log('');
-
-
-    } catch (error) {
-
-        console.error(
-            '❌ MESSAGE HANDLER ERROR:',
-            error
-        );
-    }
-
+// Health check
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    status: "running"
+  });
 });
 
 
-// ============================================================
-// /START
-// ============================================================
+// =====================================================
+// TO'LOVNI TEKSHIRISH
+// =====================================================
 
-bot.onText(/^\/start$/i, async (msg) => {
+app.get("/api/payment-status", (req, res) => {
+  const ref = String(
+    req.query.ref ||
+    req.query.phone ||
+    ""
+  ).trim();
 
-    try {
+  if (!ref) {
+    return res.status(400).json({
+      success: false,
+      paid: false,
+      message: "REF yoki telefon raqam kerak."
+    });
+  }
 
-        await bot.sendMessage(
-            msg.chat.id,
-            '✅ Bot ishlayapti.\n\nFaqat 412 000 so‘mlik Click to‘lovlari hisoblanadi.'
-        );
+  const normalizedRef = ref.replace(
+    /[^\d+]/g,
+    ""
+  );
 
-    } catch (error) {
+  const payments = loadPayments();
 
-        console.error(
-            '❌ /start xatosi:',
-            error.message
-        );
-    }
+  const payment = payments.find(
+    p =>
+      p.reference === ref ||
+      p.reference === normalizedRef
+  );
 
+  if (!payment) {
+    return res.json({
+      success: true,
+      paid: false,
+      amount: EXPECTED_AMOUNT
+    });
+  }
+
+  if (
+    payment.status === "paid" &&
+    payment.amount === EXPECTED_AMOUNT
+  ) {
+    return res.json({
+      success: true,
+      paid: true,
+      amount: EXPECTED_AMOUNT,
+      testAccess: true,
+      paymentId: payment.id
+    });
+  }
+
+  return res.json({
+    success: true,
+    paid: false,
+    amount: EXPECTED_AMOUNT
+  });
 });
 
 
-// ============================================================
-// /STATUS
-// ============================================================
+// =====================================================
+// BARCHA TO'LOVLAR
+// =====================================================
 
-bot.onText(/^\/status$/i, async (msg) => {
+app.get("/api/payments", (req, res) => {
+  const payments = loadPayments();
 
-    try {
-
-        const db = loadDb();
-
-        const totalPayments = db.payments.length;
-
-        const totalAmount =
-            totalPayments * EXPECTED_AMOUNT;
-
-
-        await bot.sendMessage(
-            msg.chat.id,
-            [
-                '📊 TO‘LOV HISOBOTI',
-                '',
-                `✅ To‘lovlar: ${totalPayments} ta`,
-                `💰 Har bir to‘lov: 412 000 so‘m`,
-                `💵 Jami: ${totalAmount.toLocaleString('uz-UZ')} so‘m`
-            ].join('\n')
-        );
-
-    } catch (error) {
-
-        console.error(
-            '❌ /status xatosi:',
-            error.message
-        );
-    }
-
+  res.json({
+    success: true,
+    count: payments.length,
+    payments
+  });
 });
 
 
-// ============================================================
-// /PAYMENTS
-// ============================================================
-
-bot.onText(/^\/payments$/i, async (msg) => {
-
-    try {
-
-        const db = loadDb();
-
-        if (db.payments.length === 0) {
-
-            await bot.sendMessage(
-                msg.chat.id,
-                'Hozircha 412 000 so‘mlik tasdiqlangan to‘lov yo‘q.'
-            );
-
-            return;
-        }
-
-
-        const lastPayments = db.payments
-            .slice(-20)
-            .reverse();
-
-
-        let response = '💰 OXIRGI TO‘LOVLAR\n\n';
-
-
-        lastPayments.forEach((payment, index) => {
-
-            response +=
-                `${index + 1}. ` +
-                `412 000 so‘m\n` +
-                `📱 ${payment.ref || 'Noma’lum'}\n` +
-                `🕐 ${payment.date}\n\n`;
-
-        });
-
-
-        await bot.sendMessage(
-            msg.chat.id,
-            response
-        );
-
-    } catch (error) {
-
-        console.error(
-            '❌ /payments xatosi:',
-            error.message
-        );
-    }
-
-});
-
-
-// ============================================================
-// WEB SERVER
-// ============================================================
-
-app.get('/', (req, res) => {
-
-    res.send(
-        'Bot ishlayapti. Faqat 412 000 so‘mlik Click to‘lovlar hisoblanadi.'
-    );
-
-});
-
-
-// ============================================================
-// STATUS API
-// ============================================================
-
-app.get('/status', (req, res) => {
-
-    try {
-
-        const db = loadDb();
-
-        const totalPayments = db.payments.length;
-
-        const totalAmount =
-            totalPayments * EXPECTED_AMOUNT;
-
-
-        res.json({
-
-            ok: true,
-
-            paid: totalPayments,
-
-            amountPerPayment: EXPECTED_AMOUNT,
-
-            totalAmount: totalAmount,
-
-            currency: 'UZS'
-
-        });
-
-    } catch (error) {
-
-        res.status(500).json({
-
-            ok: false,
-
-            error: error.message
-
-        });
-
-    }
-
-});
-
-
-// ============================================================
-// PAYMENTS API
-// ============================================================
-
-app.get('/payments', (req, res) => {
-
-    try {
-
-        const db = loadDb();
-
-        res.json({
-
-            ok: true,
-
-            count: db.payments.length,
-
-            expectedAmount: EXPECTED_AMOUNT,
-
-            payments: db.payments
-
-        });
-
-    } catch (error) {
-
-        res.status(500).json({
-
-            ok: false,
-
-            error: error.message
-
-        });
-
-    }
-
-});
-
-
-// ============================================================
+// =====================================================
 // SERVER
-// ============================================================
+// =====================================================
 
 app.listen(PORT, () => {
-
-    console.log('');
-    console.log('========================================');
-    console.log('🚀 SERVER ISHLAYAPTI');
-    console.log('========================================');
-    console.log('PORT:', PORT);
-    console.log('EXPECTED AMOUNT:', EXPECTED_AMOUNT);
-    console.log('ALLOWED CHAT:', ALLOWED_CHAT_ID);
-    console.log('========================================');
-    console.log('');
-
+  console.log("");
+  console.log("======================================");
+  console.log("🚀 SERVER ISHLADI");
+  console.log("💰 TALAB QILINADIGAN SUMMA: 412000");
+  console.log("🌐 PORT:", PORT);
+  console.log("======================================");
 });
