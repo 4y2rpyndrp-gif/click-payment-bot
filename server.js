@@ -45,6 +45,7 @@ function loadDb() {
     }
 
     return JSON.parse(data);
+
   } catch (error) {
     console.log('Database o‘qishda xato:', error.message);
     return {};
@@ -59,6 +60,7 @@ function saveDb(db) {
       JSON.stringify(db, null, 2),
       'utf8'
     );
+
   } catch (error) {
     console.log('Database saqlashda xato:', error.message);
   }
@@ -66,66 +68,95 @@ function saveDb(db) {
 
 
 // =====================================================
-// SUMMANI ANIQLASH
+// SUMMANI NORMALIZATSIYA QILISH
 // =====================================================
 
 function normalizeAmount(value) {
-  if (value == null) return null;
+
+  if (value === null || value === undefined) {
+    return null;
+  }
 
   let text = String(value)
     .replace(/\u00A0/g, ' ')
-    .replace(/\s/g, '')
     .trim();
 
-  // Masalan:
-  // 412000
-  // 412,000
-  // 412 000
-  // 412000.00
+  // Faqat raqam, nuqta, vergul va bo'sh joyni qoldiramiz
+  text = text.replace(/[^\d.,\s]/g, '');
+
+  // Bo'sh joylarni olib tashlaymiz
+  text = text.replace(/\s/g, '');
+
+  if (!text) {
+    return null;
+  }
+
+
+  // ---------------------------------------------------
   // 412,000.00
+  // 412.000,00
+  // ---------------------------------------------------
 
-  text = text.replace(/[^\d.,]/g, '');
-
-  if (!text) return null;
-
-  // 412,000.00 -> 412000.00
-  // 412.000,00 -> 412000.00
   if (text.includes(',') && text.includes('.')) {
+
     const lastComma = text.lastIndexOf(',');
     const lastDot = text.lastIndexOf('.');
 
     if (lastComma > lastDot) {
-      text = text.replace(/\./g, '').replace(',', '.');
+
+      // 412.000,00
+      text = text
+        .replace(/\./g, '')
+        .replace(',', '.');
+
     } else {
+
+      // 412,000.00
       text = text.replace(/,/g, '');
     }
   }
 
-  // 412,000 -> 412000
+  // ---------------------------------------------------
+  // 412,000
+  // ---------------------------------------------------
+
   else if (text.includes(',')) {
+
     const parts = text.split(',');
 
     if (
       parts.length === 2 &&
       parts[1].length === 3
     ) {
+
+      // 412,000
       text = parts[0] + parts[1];
+
     } else {
-      text = text.replace(/,/g, '');
+
+      // 412,00
+      text = text.replace(/,/g, '.');
     }
   }
 
-  // 412.000 -> 412000
+  // ---------------------------------------------------
+  // 412.000
+  // ---------------------------------------------------
+
   else if (text.includes('.')) {
+
     const parts = text.split('.');
 
     if (
       parts.length === 2 &&
       parts[1].length === 3
     ) {
+
+      // 412.000
       text = parts[0] + parts[1];
     }
   }
+
 
   const number = Number(text);
 
@@ -138,7 +169,26 @@ function normalizeAmount(value) {
 
 
 // =====================================================
-// CLICK TELEGRAM XABARINI TEKSHIRISH
+// CLICK XABARIDAGI SUMMA QATORINI TOPISH
+// =====================================================
+
+function isCurrencyLine(line) {
+
+  if (!line) {
+    return false;
+  }
+
+  return /(
+    сум|
+    сўм|
+    сом|
+    so['’‘`ʼʻ]?m
+  )/ix.test(line);
+}
+
+
+// =====================================================
+// CLICK GURUH XABARINI TAHLIL QILISH
 // =====================================================
 
 function parseClickMessage(text) {
@@ -147,10 +197,13 @@ function parseClickMessage(text) {
     return null;
   }
 
-  // FAQAT "Успешно подтвержден" bo'lgan Click xabari
+
+  // FAQAT MUVAFFAQIYATLI CLICK TO'LOV
   if (!/Успешно\s+подтвержден/i.test(text)) {
+
     return null;
   }
+
 
   const lines = text
     .split('\n')
@@ -159,42 +212,75 @@ function parseClickMessage(text) {
 
 
   // ---------------------------------------------------
-  // PARAMETR / TELEFON RAQAMINI OLISH
+  // PARAMETRLAR / TELEFON
   // ---------------------------------------------------
 
   const paramIdx = lines.findIndex(line =>
     /Параметры\s+оплаты/i.test(line)
   );
 
+
   let ref = null;
+
 
   if (
     paramIdx !== -1 &&
     lines[paramIdx + 1]
   ) {
+
     ref = lines[paramIdx + 1]
-      .replace(/^[^\wа-яА-Я0-9+]+/u, '')
+      .replace(
+        /^[^\wа-яА-ЯёЁ0-9+]+/u,
+        ''
+      )
       .trim();
   }
 
 
   // ---------------------------------------------------
-  // SUMMANI TOPISH
+  // SUMMA
   // ---------------------------------------------------
 
   let amount = null;
+  let amountLine = null;
+
 
   for (const line of lines) {
 
-    // Faqat "сум" bor qatorni tekshiramiz
-    if (!/сум/i.test(line)) {
+    if (!isCurrencyLine(line)) {
       continue;
     }
 
-    const detected = normalizeAmount(line);
 
-    if (detected !== null) {
-      amount = detected;
+    // Qatordagi birinchi haqiqiy raqamlar blokini olish
+    const numberMatches = line.match(
+      /\d[\d\s.,]*/g
+    );
+
+
+    if (!numberMatches || !numberMatches.length) {
+      continue;
+    }
+
+
+    // Odatda Click summasi bo'lgan raqamni olamiz.
+    // Masalan:
+    // 412,000.00 сум
+    // 412 000 сум
+    // 1 000 so'm
+    const candidate = numberMatches[0];
+
+
+    const detectedAmount = normalizeAmount(
+      candidate
+    );
+
+
+    if (detectedAmount !== null) {
+
+      amount = detectedAmount;
+      amountLine = line;
+
       break;
     }
   }
@@ -202,7 +288,8 @@ function parseClickMessage(text) {
 
   return {
     ref,
-    amount
+    amount,
+    amountLine
   };
 }
 
@@ -242,34 +329,52 @@ if (!BOT_TOKEN) {
     try {
 
       // ------------------------------------------------
-      // CHATNI TEKSHIRISH
+      // FAQAT KERAKLI GURUH
       // ------------------------------------------------
 
       if (
         ALLOWED_CHAT_ID &&
         String(msg.chat.id) !== ALLOWED_CHAT_ID
       ) {
+
         return;
       }
-
-
-      console.log('');
-      console.log('========================================');
-      console.log('YANGI TELEGRAM XABAR');
-      console.log('Chat ID:', msg.chat.id);
-      console.log('Title:', msg.chat.title || '');
-      console.log('========================================');
 
 
       const text = msg.text || '';
 
 
-      console.log('Xabar matni:');
-      console.log(text);
+      console.log('');
+      console.log(
+        '========================================'
+      );
+
+      console.log(
+        'Yangi Telegram xabar keldi'
+      );
+
+      console.log(
+        'Chat ID:',
+        msg.chat.id
+      );
+
+      console.log(
+        'Chat title:',
+        msg.chat.title || ''
+      );
+
+      console.log(
+        'Xabar:',
+        text
+      );
+
+      console.log(
+        '========================================'
+      );
 
 
       // ------------------------------------------------
-      // CLICK XABARINI PARSE QILISH
+      // CLICK XABARINI TEKSHIRISH
       // ------------------------------------------------
 
       const parsed = parseClickMessage(text);
@@ -286,7 +391,7 @@ if (!BOT_TOKEN) {
 
 
       console.log(
-        'Aniqlangan ref:',
+        'Aniqlangan REF:',
         parsed.ref
       );
 
@@ -295,9 +400,14 @@ if (!BOT_TOKEN) {
         parsed.amount
       );
 
+      console.log(
+        'Summa qatori:',
+        parsed.amountLine
+      );
+
 
       // ------------------------------------------------
-      // TELEFON RAQAMINI OLISH
+      // TELEFON / REF TEKSHIRISH
       // ------------------------------------------------
 
       if (!parsed.ref) {
@@ -326,24 +436,41 @@ if (!BOT_TOKEN) {
 
       // ------------------------------------------------
       // ENG MUHIM TEKSHIRUV
-      // FAQAT 412 000 SO'M
+      //
+      // FAQAT AYNAN 412 000 SO'M
+      //
+      // 1 000     ❌
+      // 79 000    ❌
+      // 100 000   ❌
+      // 411 999   ❌
+      // 412 000   ✅
+      // 412 001   ❌
+      // 500 000   ❌
       // ------------------------------------------------
 
-      if (parsed.amount !== EXPECTED_AMOUNT) {
+      if (
+        parsed.amount !== EXPECTED_AMOUNT
+      ) {
 
         console.log('');
-        console.log('❌ TO‘LOV TASDIQLANMADI');
+        console.log(
+          '❌ TO‘LOV TASDIQLANMADI'
+        );
+
         console.log(
           'Kelgan summa:',
           parsed.amount
         );
+
         console.log(
           'Kerakli summa:',
           EXPECTED_AMOUNT
         );
+
         console.log(
-          'Sabab: summa 412 000 so‘mga teng emas.'
+          'Sabab: summa aynan 412 000 so‘m emas.'
         );
+
         console.log('');
 
         return;
@@ -351,15 +478,22 @@ if (!BOT_TOKEN) {
 
 
       // ------------------------------------------------
-      // FAQAT ANIQLIK BILAN 412 000 BO'LSA SAQLAYMIZ
+      // OLDINGI MA'LUMOTNI TEKSHIRISH
       // ------------------------------------------------
 
       const db = loadDb();
 
 
+      // ------------------------------------------------
+      // FAQAT 412 000 BO'LSA SAQLAYMIZ
+      // ------------------------------------------------
+
       db[phoneDigits] = {
+
         status: 'paid',
+
         amount: EXPECTED_AMOUNT,
+
         paidAt: new Date().toISOString()
       };
 
@@ -368,97 +502,146 @@ if (!BOT_TOKEN) {
 
 
       console.log('');
-      console.log('========================================');
-      console.log('✅ TO‘LOV TASDIQLANDI');
-      console.log('Telefon:', phoneDigits);
-      console.log('Summa:', EXPECTED_AMOUNT);
-      console.log('========================================');
+      console.log(
+        '========================================'
+      );
+
+      console.log(
+        '✅ TO‘LOV TASDIQLANDI'
+      );
+
+      console.log(
+        'Telefon:',
+        phoneDigits
+      );
+
+      console.log(
+        'Summa:',
+        EXPECTED_AMOUNT
+      );
+
+      console.log(
+        '========================================'
+      );
+
       console.log('');
 
     } catch (error) {
 
       console.log(
-        'Telegram xabarini qayta ishlashda xato:',
+        '❌ Xabarni qayta ishlashda xato:',
         error.message
       );
-
     }
 
   });
-
 }
 
 
 // =====================================================
-// TEST / STATUS API
+// STATUS API
+// =====================================================
+//
+// Test sayti shu manzilni tekshiradi:
+//
+// /status/998901234567
+//
+// Faqat aynan 412000 bo'lsa:
+// paid: true
+//
+// 1000 bo'lsa:
+// paid: false
 // =====================================================
 
-// Sayt shu endpoint orqali:
-// "Bu telefon egasi to'laganmi?"
-// deb tekshiradi.
+app.get(
+  '/status/:phone',
+  (req, res) => {
 
-app.get('/status/:phone', (req, res) => {
-
-  res.set(
-    'Access-Control-Allow-Origin',
-    '*'
-  );
-
-  const phone = req.params.phone
-    .replace(/[^0-9]/g, '');
+    res.set(
+      'Access-Control-Allow-Origin',
+      '*'
+    );
 
 
-  const db = loadDb();
+    const phone = req.params.phone
+      .replace(/[^0-9]/g, '');
 
-  const record = db[phone];
+
+    const db = loadDb();
 
 
-  if (
-    record &&
-    record.status === 'paid' &&
-    Number(record.amount) === EXPECTED_AMOUNT
-  ) {
+    const record = db[phone];
+
+
+    // ------------------------------------------------
+    // FAQAT AYNAN 412 000 BO'LSA PAID
+    // ------------------------------------------------
+
+    const isPaid = !!(
+      record &&
+      record.status === 'paid' &&
+      Number(record.amount) === EXPECTED_AMOUNT
+    );
+
 
     return res.json({
-      paid: true,
+
+      paid: isPaid,
+
       amount: EXPECTED_AMOUNT
+
     });
-
   }
-
-
-  return res.json({
-    paid: false,
-    amount: EXPECTED_AMOUNT
-  });
-
-});
+);
 
 
 // =====================================================
 // HOME
 // =====================================================
 
-app.get('/', (req, res) => {
+app.get(
+  '/',
+  (req, res) => {
 
-  res.send(
-    'Payment verification server ishlamoqda.'
-  );
-
-});
+    res.send(
+      'Payment verification server ishlamoqda.'
+    );
+  }
+);
 
 
 // =====================================================
 // SERVER
 // =====================================================
 
-app.listen(PORT, () => {
+app.listen(
+  PORT,
+  () => {
 
-  console.log('');
-  console.log('========================================');
-  console.log('SERVER ISHLADI');
-  console.log('Kerakli summa: 412000 so‘m');
-  console.log('PORT:', PORT);
-  console.log('========================================');
+    console.log('');
+    console.log(
+      '========================================'
+    );
 
-});
+    console.log(
+      '✅ SERVER ISHLADI'
+    );
+
+    console.log(
+      'Kerakli summa: 412000 so‘m'
+    );
+
+    console.log(
+      'Faqat aynan 412000 qabul qilinadi.'
+    );
+
+    console.log(
+      'PORT:',
+      PORT
+    );
+
+    console.log(
+      '========================================'
+    );
+  }
+);
