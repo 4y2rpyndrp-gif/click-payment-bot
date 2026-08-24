@@ -1,1010 +1,168 @@
+// Germaniya viza testi — to'liq backend.
+// 1) Telegram guruhdagi Click bildirishnomalarini o'qib, to'lovni avtomatik tasdiqlaydi
+// 2) Test sahifasi (istalgan joyda joylashtirilgan — Netlify, va h.k.) uchun
+//    oferta rozilik, test natijalari va admin panelni saqlaydi
+
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
+const TelegramBot = require('node-telegram-bot-api');
 
-const app = express();
+// ==== SOZLAMALAR ====
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || 'PUT_YOUR_BOT_TOKEN_HERE';
+const ALLOWED_CHAT_ID = process.env.CLICK_GROUP_CHAT_ID || '';
+const EXPECTED_AMOUNT = 412000; // so'mda, test narxi
 
-app.use(express.json({ limit: '1mb' }));
-app.use(express.urlencoded({ extended: true }));
-
-// ======================================================
-// SOZLAMALAR
-// ======================================================
-
-const BOT_TOKEN = String(
-  process.env.TELEGRAM_BOT_TOKEN || ''
-).trim();
-
-const ALLOWED_CHAT_ID = String(
-  process.env.CLICK_GROUP_CHAT_ID || '-5037525525'
-).trim();
-
-// TEST UCHUN KERAKLI MINIMAL SUMMA
-const EXPECTED_AMOUNT = 412000;
-
-// RENDER PORT
-const PORT = Number(process.env.PORT || 3000);
-
-// RENDER PUBLIC URL
-const PUBLIC_URL = String(
-  process.env.PUBLIC_URL ||
-  process.env.RENDER_EXTERNAL_URL ||
-  'https://click-payment-bot.onrender.com'
-).replace(/\/$/, '');
-
-// ======================================================
-// TOKEN TEKSHIRUVI
-// ======================================================
-
-if (!BOT_TOKEN) {
-  console.error(
-    'ERROR: TELEGRAM_BOT_TOKEN environment variable topilmadi.'
-  );
-
-  process.exit(1);
+// ---- Oddiy fayl-baza yordamchilari ----
+function dbPath(name) { return path.join(__dirname, name + '.json'); }
+function loadJson(name, fallback) {
+  try { return JSON.parse(fs.readFileSync(dbPath(name), 'utf8')); }
+  catch (e) { return fallback; }
+}
+function saveJson(name, data) {
+  fs.writeFileSync(dbPath(name), JSON.stringify(data, null, 2));
 }
 
-// ======================================================
-// DATABASE
-// ======================================================
+// payments: { "<phoneDigits>": { status:'paid', amount, paidAt } }
+function loadPayments() { return loadJson('payments', {}); }
+function savePayments(db) { saveJson('payments', db); }
 
-const DB_FILE = path.join(__dirname, 'payments.json');
+// pending: { "<phoneDigits>": { name, phone, amount, receiptId, timestamp, status:'pending'|'approved'|'rejected' } }
+function loadPending() { return loadJson('pending', {}); }
+function savePending(db) { saveJson('pending', db); }
 
-function loadDb() {
-  try {
-    if (!fs.existsSync(DB_FILE)) {
-      return {
-        payments: {},
-        transactions: {}
-      };
-    }
+// consents: [ {name, phone, timestamp} ]
+function loadConsents() { return loadJson('consents', []); }
+function saveConsents(list) { saveJson('consents', list); }
 
-    const raw = fs.readFileSync(DB_FILE, 'utf8');
-    const data = JSON.parse(raw);
+// submissions: [ {name, phone, direction, sector, specialty, lang, prof, passed, timestamp} ]
+function loadSubmissions() { return loadJson('submissions', []); }
+function saveSubmissions(list) { saveJson('submissions', list); }
 
-    return {
-      payments:
-        data &&
-        typeof data.payments === 'object'
-          ? data.payments
-          : {},
+function digits(s) { return (s || '').replace(/[^0-9]/g, ''); }
 
-      transactions:
-        data &&
-        typeof data.transactions === 'object'
-          ? data.transactions
-          : {}
-    };
-
-  } catch (error) {
-
-    console.error(
-      'DB READ ERROR:',
-      error.message
-    );
-
-    return {
-      payments: {},
-      transactions: {}
-    };
-  }
-}
-
-function saveDb(db) {
-
-  const tempFile = `${DB_FILE}.tmp`;
-
-  fs.writeFileSync(
-    tempFile,
-    JSON.stringify(db, null, 2),
-    'utf8'
-  );
-
-  fs.renameSync(
-    tempFile,
-    DB_FILE
-  );
-}
-
-// ======================================================
-// TELEFON RAQAMNI NORMALIZATSIYA
-// ======================================================
-
-function normalizePhone(value) {
-
-  const digits = String(value || '')
-    .replace(/\D/g, '');
-
-  // 998901234567
-  if (
-    digits.length === 12 &&
-    digits.startsWith('998')
-  ) {
-    return digits;
-  }
-
-  // 901234567
-  if (
-    digits.length === 9 &&
-    digits.startsWith('9')
-  ) {
-    return `998${digits}`;
-  }
-
-  return digits;
-}
-
-// ======================================================
-// SUMMANI AJRATISH
-// ======================================================
-
-function parseAmount(value) {
-
-  const text = String(value || '')
-    .replace(/\u00a0/g, ' ');
-
-  const match = text.match(
-    /(\d[\d\s,.]*)(?:\s*(?:сум|so['’`]?\s*m|uzs))?/i
-  );
-
-  if (!match) {
-    return null;
-  }
-
-  let numberText = match[1]
-    .replace(/\s/g, '');
-
-  // 412,000.00
-  if (
-    numberText.includes(',') &&
-    numberText.includes('.')
-  ) {
-
-    numberText =
-      numberText.replace(/,/g, '');
-  }
-
-  // 412,000
-  else if (
-    numberText.includes(',')
-  ) {
-
-    const parts =
-      numberText.split(',');
-
-    if (
-      parts.length === 2 &&
-      parts[1].length === 2
-    ) {
-
-      numberText =
-        `${parts[0]}.${parts[1]}`;
-
-    } else {
-
-      numberText =
-        numberText.replace(/,/g, '');
-    }
-  }
-
-  const amount =
-    Number(numberText);
-
-  if (!Number.isFinite(amount)) {
-    return null;
-  }
-
-  return Math.round(amount);
-}
-
-// ======================================================
-// CLICK TELEGRAM XABARINI TAHLIL QILISH
-// ======================================================
-
+// ---- Click guruh xabarini tahlil qilish ----
 function parseClickMessage(text) {
-
-  if (!text) {
-    return null;
-  }
-
-  const normalized =
-    String(text).replace(/\r/g, '');
-
-  // Faqat muvaffaqiyatli to'lov
-  if (
-    !/Успешно\s+подтвержден/i.test(
-      normalized
-    )
-  ) {
-    return null;
-  }
-
-  const lines =
-    normalized
-      .split('\n')
-      .map(line => line.trim())
-      .filter(Boolean);
-
-  // ----------------------------------------------------
-  // PARAMETRLAR QATORI
-  // ----------------------------------------------------
-
-  const paramIndex =
-    lines.findIndex(line =>
-      /Параметры\s+оплаты/i.test(line)
-    );
-
+  if (!text || !/Успешно подтвержден/i.test(text)) return null;
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const paramIdx = lines.findIndex(l => /Параметры оплаты/i.test(l));
   let ref = null;
-
-  if (paramIndex >= 0) {
-
-    for (
-      let i = paramIndex + 1;
-      i < Math.min(
-        lines.length,
-        paramIndex + 6
-      );
-      i++
-    ) {
-
-      const phone =
-        lines[i].match(
-          /(?:\+?998[\s-]?\d{2}[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}|\+?998\d{9}|\b9\d{8}\b)/
-        );
-
-      if (phone) {
-
-        ref = phone[0];
-
-        break;
-      }
-    }
+  if (paramIdx !== -1 && lines[paramIdx + 1]) {
+    ref = lines[paramIdx + 1].replace(/^[^\wа-яА-Я0-9+]+/u, '').trim();
   }
-
-  // ----------------------------------------------------
-  // FALLBACK TELEFON QIDIRISH
-  // ----------------------------------------------------
-
-  if (!ref) {
-
-    const phone =
-      normalized.match(
-        /(?:\+?998\d{9}|\b9\d{8}\b)/
-      );
-
-    if (phone) {
-      ref = phone[0];
-    }
+  const amountLine = lines.find(l => /сум/i.test(l));
+  let amount = null;
+  if (amountLine) {
+    const d = amountLine.replace(/[^\d.,]/g, '').replace(/,/g, '');
+    amount = Math.round(parseFloat(d));
   }
-
-  // ----------------------------------------------------
-  // SUMMA
-  // ----------------------------------------------------
-
-  const amountLine =
-    lines.find(line =>
-      /(сум|so['’`]?\s*m|uzs)/i.test(line)
-    );
-
-  const amount =
-    parseAmount(
-      amountLine || ''
-    );
-
-  // ----------------------------------------------------
-  // CLICK ID
-  // ----------------------------------------------------
-
-  const idMatch =
-    normalized.match(
-      /(?:^|\n)\s*ID\s*[:#-]?\s*(\d{4,})/i
-    );
-
-  const clickTransId =
-    idMatch
-      ? idMatch[1]
-      : null;
-
-  return {
-
-    ref:
-      normalizePhone(ref),
-
-    amount,
-
-    clickTransId,
-
-    text:
-      normalized
-  };
+  return { ref, amount };
 }
 
-// ======================================================
-// TELEFONNI LOGDA YASHIRISH
-// ======================================================
+// ---- Telegram bot: guruh xabarlarini tinglaydi ----
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-function maskPhone(phone) {
+bot.on('message', (msg) => {
+  if (ALLOWED_CHAT_ID && String(msg.chat.id) !== String(ALLOWED_CHAT_ID)) return;
+  console.log('Xabar keldi. chat.id =', msg.chat.id, '| chat.title =', msg.chat.title);
 
-  const p =
-    normalizePhone(phone);
+  const parsed = parseClickMessage(msg.text || '');
+  if (!parsed || !parsed.ref) return;
 
-  if (p.length < 7) {
-    return p;
-  }
-
-  return (
-    `${p.slice(0, 6)}****${p.slice(-2)}`
-  );
-}
-
-// ======================================================
-// TELEGRAM API
-// ======================================================
-
-async function telegram(
-  method,
-  body = {}
-) {
-
-  const response =
-    await fetch(
-      `https://api.telegram.org/bot${BOT_TOKEN}/${method}`,
-      {
-        method: 'POST',
-
-        headers: {
-          'content-type':
-            'application/json'
-        },
-
-        body:
-          JSON.stringify(body)
-      }
-    );
-
-  const data =
-    await response
-      .json()
-      .catch(() => ({}));
-
-  if (
-    !response.ok ||
-    !data.ok
-  ) {
-
-    throw new Error(
-      data.description ||
-      `Telegram HTTP ${response.status}`
-    );
-  }
-
-  return data.result;
-}
-
-// ======================================================
-// WEBHOOK
-// ======================================================
-
-// Muhim:
-// BU KODDA POLLING YO'Q.
-// getUpdates YO'Q.
-// Faqat webhook ishlaydi.
-
-const WEBHOOK_SECRET =
-  String(
-    process.env.TELEGRAM_WEBHOOK_SECRET ||
-    crypto
-      .createHash('sha256')
-      .update(BOT_TOKEN)
-      .digest('hex')
-      .slice(0, 32)
-  );
-
-const WEBHOOK_PATH =
-  `/telegram/webhook/${WEBHOOK_SECRET}`;
-
-const WEBHOOK_URL =
-  `${PUBLIC_URL}${WEBHOOK_PATH}`;
-
-// ======================================================
-// TELEGRAM WEBHOOKNI O'RNATISH
-// ======================================================
-
-async function setupTelegramWebhook() {
-
-  const me =
-    await telegram('getMe');
-
-  console.log(
-    `Telegram bot: @${me.username || me.first_name || 'unknown'}`
-  );
-
-  console.log(
-    `Webhook URL: ${PUBLIC_URL}/telegram/webhook/[secret]`
-  );
-
-  // Eski webhook o'rniga aynan shu webhook o'rnatiladi.
-  const result =
-    await telegram(
-      'setWebhook',
-      {
-        url:
-          WEBHOOK_URL,
-
-        secret_token:
-          WEBHOOK_SECRET,
-
-        allowed_updates:
-          ['message'],
-
-        drop_pending_updates:
-          false,
-
-        max_connections:
-          10
-      }
-    );
-
-  console.log(
-    'TELEGRAM WEBHOOK SET:',
-    result === true
-      ? 'OK'
-      : result
-  );
-
-  const info =
-    await telegram(
-      'getWebhookInfo'
-    );
-
-  console.log(
-    'WEBHOOK ACTIVE:',
-    Boolean(info.url)
-  );
-
-  console.log(
-    'WEBHOOK PENDING:',
-    info.pending_update_count || 0
-  );
-
-  if (
-    info.last_error_message
-  ) {
-
-    console.log(
-      'WEBHOOK LAST ERROR:',
-      info.last_error_message
-    );
-  }
-}
-
-// ======================================================
-// CLICK XABARINI QABUL QILISH
-// ======================================================
-
-function processClickMessage(
-  message
-) {
-
-  if (!message) {
+  const phoneDigits = digits(parsed.ref);
+  if (!phoneDigits) return;
+  if (parsed.amount == null || parsed.amount < EXPECTED_AMOUNT) {
+    console.log('CLICK PAYMENT IGNORED (amount mismatch):', parsed);
     return;
   }
 
-  const chatId =
-    String(
-      message.chat?.id ?? ''
-    );
+  console.log('CLICK PAYMENT FOUND:', { ref: phoneDigits, amount: parsed.amount });
 
-  const chatTitle =
-    message.chat?.title ||
-    message.chat?.username ||
-    'private';
+  const payments = loadPayments();
+  payments[phoneDigits] = { status: 'paid', amount: parsed.amount, paidAt: new Date().toISOString() };
+  savePayments(payments);
 
-  const text =
-    message.text ||
-    message.caption ||
-    '';
+  // pending yozuvi bo'lsa, uni ham yopamiz (tarix uchun)
+  const pending = loadPending();
+  if (pending[phoneDigits]) { pending[phoneDigits].status = 'approved'; savePending(pending); }
 
-  console.log(
-    'TELEGRAM MESSAGE:',
-    JSON.stringify({
-      chatId,
-      chatTitle,
-      messageId:
-        message.message_id
-    })
-  );
+  console.log('PAYMENT CONFIRMED:', phoneDigits, '|', parsed.amount, "so'm");
+});
 
-  // Faqat CLICK guruhidan
-  if (
-    ALLOWED_CHAT_ID &&
-    chatId !== ALLOWED_CHAT_ID
-  ) {
+// ==== HTTP API ====
+const app = express();
+app.use(express.json());
+app.use((req, res, next) => { res.set('Access-Control-Allow-Origin', '*'); res.set('Access-Control-Allow-Headers', 'Content-Type'); next(); });
+app.options('*', (req, res) => res.sendStatus(200));
 
-    console.log(
-      'IGNORED CHAT:',
-      chatId
-    );
+app.get('/', (req, res) => res.send('Bot ishlamoqda.'));
 
-    return;
+// ---- To'lov holati (asosiy, avtomatik) ----
+app.get('/status/:phone', (req, res) => {
+  const payments = loadPayments();
+  const rec = payments[digits(req.params.phone)];
+  res.json({ paid: !!(rec && rec.status === 'paid') });
+});
+
+// ---- Oferta roziligi ----
+app.post('/api/consent', (req, res) => {
+  const { name, phone } = req.body || {};
+  if (!name || !phone) return res.status(400).json({ ok: false, error: 'name/phone required' });
+  const list = loadConsents();
+  list.push({ name, phone, timestamp: new Date().toISOString() });
+  saveConsents(list);
+  res.json({ ok: true });
+});
+
+// ---- "To'lov qildim" — kutish navbatiga qo'shish (admin zaxira tasdig'i uchun) ----
+app.post('/api/pending', (req, res) => {
+  const { name, phone, amount, receiptId } = req.body || {};
+  if (!name || !phone) return res.status(400).json({ ok: false, error: 'name/phone required' });
+  const pending = loadPending();
+  pending[digits(phone)] = { name, phone, amount: amount || EXPECTED_AMOUNT, receiptId: receiptId || '', timestamp: new Date().toISOString(), status: 'pending' };
+  savePending(pending);
+  res.json({ ok: true });
+});
+
+// ---- Admin: kutilayotgan to'lovlar ro'yxati ----
+app.get('/api/pending', (req, res) => {
+  const pending = loadPending();
+  const list = Object.values(pending).filter(p => p.status === 'pending');
+  res.json({ pending: list });
+});
+
+// ---- Admin: to'lovni qo'lda tasdiqlash/rad etish ----
+app.post('/api/pending/:phone/resolve', (req, res) => {
+  const { status, reason } = req.body || {}; // 'approved' | 'rejected'
+  const key = digits(req.params.phone);
+  const pending = loadPending();
+  if (!pending[key]) return res.status(404).json({ ok: false, error: 'not found' });
+  pending[key].status = status;
+  pending[key].reason = reason || '';
+  savePending(pending);
+
+  if (status === 'approved') {
+    const payments = loadPayments();
+    payments[key] = { status: 'paid', amount: pending[key].amount, paidAt: new Date().toISOString() };
+    savePayments(payments);
   }
-
-  const parsed =
-    parseClickMessage(text);
-
-  if (!parsed) {
-    return;
-  }
-
-  console.log(
-    'CLICK PAYMENT FOUND:',
-    JSON.stringify({
-      ref:
-        maskPhone(parsed.ref),
-
-      amount:
-        parsed.amount,
-
-      clickTransId:
-        parsed.clickTransId
-    })
-  );
-
-  // Telefon topilmasa
-  if (!parsed.ref) {
-
-    console.log(
-      'IGNORED: phone/reference topilmadi.'
-    );
-
-    return;
-  }
-
-  // Summa topilmasa
-  if (
-    parsed.amount === null
-  ) {
-
-    console.log(
-      'IGNORED: summa topilmadi.'
-    );
-
-    return;
-  }
-
-  // Yetarli summa emas
-  if (
-    parsed.amount <
-    EXPECTED_AMOUNT
-  ) {
-
-    console.log(
-      `IGNORED: amount ${parsed.amount} < required ${EXPECTED_AMOUNT}`
-    );
-
-    return;
-  }
-
-  const db =
-    loadDb();
-
-  const now =
-    new Date().toISOString();
-
-  const phone =
-    parsed.ref;
-
-  const transactionKey =
-    parsed.clickTransId ||
-    `${phone}:${parsed.amount}:${message.message_id}`;
-
-  // ----------------------------------------------------
-  // DUPLIKAT TO'LOV
-  // ----------------------------------------------------
-
-  if (
-    db.transactions[
-      transactionKey
-    ]?.status === 'paid'
-  ) {
-
-    console.log(
-      'DUPLICATE PAYMENT IGNORED:',
-      transactionKey
-    );
-
-    return;
-  }
-
-  // ----------------------------------------------------
-  // TO'LOVNI SAQLASH
-  // ----------------------------------------------------
-
-  const record = {
-
-    status:
-      'paid',
-
-    amount:
-      parsed.amount,
-
-    requiredAmount:
-      EXPECTED_AMOUNT,
-
-    phone:
-      phone,
-
-    clickTransId:
-      parsed.clickTransId,
-
-    telegramChatId:
-      chatId,
-
-    telegramMessageId:
-      message.message_id,
-
-    paidAt:
-      now
-  };
-
-  db.payments[phone] =
-    record;
-
-  db.transactions[
-    transactionKey
-  ] =
-    record;
-
-  saveDb(db);
-
-  console.log(
-    `PAYMENT CONFIRMED: ${maskPhone(phone)} | ${parsed.amount} so'm`
-  );
-}
-
-// ======================================================
-// TELEGRAM WEBHOOK ENDPOINT
-// ======================================================
-
-app.post(
-  WEBHOOK_PATH,
-  (req, res) => {
-
-    const incomingSecret =
-      String(
-        req.get(
-          'X-Telegram-Bot-Api-Secret-Token'
-        ) || ''
-      );
-
-    // Telegram emas bo'lsa
-    if (
-      incomingSecret !==
-      WEBHOOK_SECRET
-    ) {
-
-      console.warn(
-        'TELEGRAM WEBHOOK: invalid secret'
-      );
-
-      return res.sendStatus(403);
-    }
-
-    try {
-
-      processClickMessage(
-        req.body?.message
-      );
-
-      return res.sendStatus(200);
-
-    } catch (error) {
-
-      console.error(
-        'TELEGRAM UPDATE ERROR:',
-        error
-      );
-
-      return res.sendStatus(500);
-    }
-  }
-);
-
-// ======================================================
-// ASOSIY SERVER
-// ======================================================
-
-app.get(
-  '/',
-  (req, res) => {
-
-    res.json({
-
-      ok: true,
-
-      service:
-        'click-payment-bot',
-
-      mode:
-        'telegram-webhook',
-
-      expectedAmount:
-        EXPECTED_AMOUNT,
-
-      webhook:
-        true,
-
-      time:
-        new Date().toISOString()
-    });
-  }
-);
-
-// ======================================================
-// HEALTH CHECK
-// ======================================================
-
-app.get(
-  '/health',
-  (req, res) => {
-
-    res.json({
-
-      ok: true,
-
-      status:
-        'online'
-    });
-  }
-);
-
-// ======================================================
-// TO'LOV STATUSINI TEKSHIRISH
-// ======================================================
-
-app.get(
-  '/status/:phone',
-  (req, res) => {
-
-    res.set(
-      'Access-Control-Allow-Origin',
-      '*'
-    );
-
-    res.set(
-      'Cache-Control',
-      'no-store'
-    );
-
-    const phone =
-      normalizePhone(
-        req.params.phone
-      );
-
-    const db =
-      loadDb();
-
-    const record =
-      db.payments[phone];
-
-    res.json({
-
-      paid:
-        Boolean(
-          record &&
-          record.status === 'paid'
-        ),
-
-      phone:
-        phone,
-
-      amount:
-        record?.amount ??
-        null,
-
-      paidAt:
-        record?.paidAt ??
-        null,
-
-      status:
-        record?.status ??
-        'unpaid'
-    });
-  }
-);
-
-// ======================================================
-// BARCHA TO'LOVLAR
-// ======================================================
-
-app.get(
-  '/api/payments',
-  (req, res) => {
-
-    res.set(
-      'Cache-Control',
-      'no-store'
-    );
-
-    const db =
-      loadDb();
-
-    const payments =
-      Object.values(
-        db.payments
-      ).sort(
-        (a, b) =>
-          String(
-            b.paidAt || ''
-          ).localeCompare(
-            String(
-              a.paidAt || ''
-            )
-          )
-      );
-
-    res.json({
-
-      success:
-        true,
-
-      count:
-        payments.length,
-
-      payments:
-        payments
-    });
-  }
-);
-
-// ======================================================
-// BITTA TO'LOV
-// ======================================================
-
-app.get(
-  '/api/payment/:phone',
-  (req, res) => {
-
-    res.set(
-      'Cache-Control',
-      'no-store'
-    );
-
-    const phone =
-      normalizePhone(
-        req.params.phone
-      );
-
-    const db =
-      loadDb();
-
-    const payment =
-      db.payments[phone] ||
-      null;
-
-    res.json({
-
-      success:
-        true,
-
-      phone:
-        phone,
-
-      payment:
-        payment
-    });
-  }
-);
-
-// ======================================================
-// 404
-// ======================================================
-
-app.use(
-  (req, res) => {
-
-    res.status(404).json({
-
-      ok:
-        false,
-
-      error:
-        'Not found'
-    });
-  }
-);
-
-// ======================================================
-// SERVER START
-// ======================================================
-
-const server =
-  app.listen(
-    PORT,
-    '0.0.0.0',
-    async () => {
-
-      console.log(
-        '=========================================='
-      );
-
-      console.log(
-        'CLICK PAYMENT SERVER STARTED'
-      );
-
-      console.log(
-        `PORT: ${PORT}`
-      );
-
-      console.log(
-        `EXPECTED AMOUNT: ${EXPECTED_AMOUNT} so'm`
-      );
-
-      console.log(
-        `ALLOWED CHAT: ${ALLOWED_CHAT_ID || 'ANY'}`
-      );
-
-      console.log(
-        `PUBLIC URL: ${PUBLIC_URL}`
-      );
-
-      console.log(
-        'MODE: TELEGRAM WEBHOOK ONLY'
-      );
-
-      console.log(
-        'POLLING: DISABLED'
-      );
-
-      console.log(
-        '=========================================='
-      );
-
-      try {
-
-        await setupTelegramWebhook();
-
-      } catch (error) {
-
-        console.error(
-          'TELEGRAM WEBHOOK SETUP ERROR:',
-          error.message
-        );
-
-        console.error(
-          'Server online, lekin Telegram webhook ishlamayapti.'
-        );
-      }
-    }
-  );
-
-// ======================================================
-// SERVERNI TO'G'RI YOPISH
-// ======================================================
-
-function shutdown(signal) {
-
-  console.log(
-    `Received ${signal}. Shutting down...`
-  );
-
-  server.close(
-    () => process.exit(0)
-  );
-
-  setTimeout(
-    () => process.exit(1),
-    10000
-  ).unref();
-}
-
-process.on(
-  'SIGTERM',
-  () => shutdown('SIGTERM')
-);
-
-process.on(
-  'SIGINT',
-  () => shutdown('SIGINT')
-);
+  res.json({ ok: true });
+});
+
+// ---- Test natijasi ----
+app.post('/api/submission', (req, res) => {
+  const record = req.body || {};
+  if (!record.name || !record.phone) return res.status(400).json({ ok: false, error: 'name/phone required' });
+  const list = loadSubmissions();
+  list.push({ ...record, timestamp: new Date().toISOString() });
+  saveSubmissions(list);
+  res.json({ ok: true });
+});
+
+// ---- Admin: barcha test natijalari ----
+app.get('/api/submissions', (req, res) => {
+  res.json({ submissions: loadSubmissions().slice().reverse() });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('Server ishga tushdi, port:', PORT));
