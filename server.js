@@ -1,94 +1,143 @@
-const express = require("express");
-const fs = require("fs");
-const path = require("path");
-const TelegramBot = require("node-telegram-bot-api");
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const TelegramBot = require('node-telegram-bot-api');
 
 const app = express();
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
-// =====================================================
-// SOZLAMALAR
-// =====================================================
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+
+  next();
+});
+
+// ============================================================
+// CONFIG
+// ============================================================
 
 const BOT_TOKEN = String(
-  process.env.TELEGRAM_BOT_TOKEN || ""
+  process.env.TELEGRAM_BOT_TOKEN || ''
 ).trim();
 
 const ALLOWED_CHAT_ID = String(
-  process.env.CLICK_GROUP_CHAT_ID || ""
+  process.env.CLICK_GROUP_CHAT_ID || ''
 ).trim();
 
-// FAQAT SHU SUMMA QABUL QILINADI
+const PUBLIC_URL = String(
+  process.env.PUBLIC_URL ||
+  'https://click-payment-bot.onrender.com'
+).trim().replace(/\/$/, '');
+
+const WEBHOOK_SECRET = String(
+  process.env.TELEGRAM_WEBHOOK_SECRET ||
+  crypto.randomBytes(32).toString('hex')
+).trim();
+
 const EXPECTED_AMOUNT = 412000;
+const PORT = Number(process.env.PORT || 3000);
 
-// To'lovlar bazasi
-const DB_FILE = path.join(__dirname, "payments.json");
+const DB_FILE = path.join(__dirname, 'payments.json');
+const WEBHOOK_PATH = '/telegram/webhook';
 
-// Render porti
-const PORT = Number(process.env.PORT) || 3000;
+if (!BOT_TOKEN) {
+  throw new Error('TELEGRAM_BOT_TOKEN topilmadi');
+}
 
+if (!ALLOWED_CHAT_ID) {
+  throw new Error('CLICK_GROUP_CHAT_ID topilmadi');
+}
 
-// =====================================================
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+  throw new Error('PORT noto‘g‘ri');
+}
+
+// ============================================================
 // DATABASE
-// =====================================================
+// ============================================================
+
+function emptyDb() {
+  return {
+    version: 1,
+    payments: []
+  };
+}
 
 function loadDb() {
   try {
     if (!fs.existsSync(DB_FILE)) {
-      return {};
+      return emptyDb();
     }
 
-    const data = fs.readFileSync(DB_FILE, "utf8");
+    const raw = fs.readFileSync(
+      DB_FILE,
+      'utf8'
+    );
 
-    if (!data.trim()) {
-      return {};
+    const parsed = JSON.parse(raw);
+
+    if (
+      !parsed ||
+      !Array.isArray(parsed.payments)
+    ) {
+      return emptyDb();
     }
 
-    const db = JSON.parse(data);
-
-    if (!db || typeof db !== "object") {
-      return {};
-    }
-
-    return db;
+    return {
+      version: Number(parsed.version) || 1,
+      payments: parsed.payments
+    };
 
   } catch (error) {
-    console.log(
-      "Database o'qishda xato:",
+    console.error(
+      'DB READ ERROR:',
       error.message
     );
 
-    return {};
+    return emptyDb();
   }
 }
-
 
 function saveDb(db) {
+  const tempFile = `${DB_FILE}.tmp`;
+
   try {
     fs.writeFileSync(
-      DB_FILE,
+      tempFile,
       JSON.stringify(db, null, 2),
-      "utf8"
+      'utf8'
     );
 
-    return true;
+    fs.renameSync(
+      tempFile,
+      DB_FILE
+    );
 
   } catch (error) {
-    console.log(
-      "Database saqlashda xato:",
-      error.message
-    );
 
-    return false;
+    try {
+      if (fs.existsSync(tempFile)) {
+        fs.unlinkSync(tempFile);
+      }
+    } catch (_) {}
+
+    throw error;
   }
 }
 
-
-// =====================================================
-// SUMMANI NORMALIZATSIYA QILISH
-// =====================================================
+// ============================================================
+// NORMALIZATION
+// ============================================================
 
 function normalizeAmount(value) {
 
@@ -99,755 +148,748 @@ function normalizeAmount(value) {
     return null;
   }
 
-  let text = String(value)
-    .replace(/\u00A0/g, " ")
-    .replace(/\u202F/g, " ")
-    .trim();
+  const s = String(value)
+    .replace(/[^0-9]/g, '');
 
-  // Faqat raqam, nuqta, vergul va bo'sh joy
-  text = text.replace(/[^\d.,\s]/g, "");
-
-  // Barcha bo'sh joylarni olib tashlash
-  text = text.replace(/\s/g, "");
-
-  if (!text) {
+  if (!s) {
     return null;
   }
 
+  const n = Number(s);
 
-  // 412,000.00
-  // 412.000,00
+  return Number.isSafeInteger(n)
+    ? n
+    : null;
+}
+
+function normalizePhone(value) {
+
   if (
-    text.includes(",") &&
-    text.includes(".")
+    value === null ||
+    value === undefined
   ) {
-
-    const lastComma =
-      text.lastIndexOf(",");
-
-    const lastDot =
-      text.lastIndexOf(".");
-
-    if (lastComma > lastDot) {
-
-      // 412.000,00
-      text = text
-        .replace(/\./g, "")
-        .replace(",", ".");
-
-    } else {
-
-      // 412,000.00
-      text = text.replace(/,/g, "");
-    }
-
+    return '';
   }
 
-  // 412,000
-  else if (text.includes(",")) {
+  const digits = String(value)
+    .replace(/\D/g, '');
 
-    const parts = text.split(",");
-
-    if (
-      parts.length === 2 &&
-      parts[1].length === 3
-    ) {
-
-      // 412,000
-      text = parts[0] + parts[1];
-
-    } else {
-
-      // 412,00
-      text = text.replace(/,/g, ".");
-    }
+  if (
+    digits.startsWith('998') &&
+    digits.length === 12
+  ) {
+    return digits;
   }
 
-  // 412.000
-  else if (text.includes(".")) {
-
-    const parts = text.split(".");
-
-    if (
-      parts.length === 2 &&
-      parts[1].length === 3
-    ) {
-
-      // 412.000
-      text = parts[0] + parts[1];
-    }
+  if (digits.length === 9) {
+    return `998${digits}`;
   }
 
-
-  const number = Number(text);
-
-  if (!Number.isFinite(number)) {
-    return null;
-  }
-
-  return Math.round(number);
+  return digits;
 }
 
+// ============================================================
+// CLICK MESSAGE PARSER
+// ============================================================
 
-// =====================================================
-// VALYUTA QATORINI TEKSHIRISH
-// =====================================================
-
-function isCurrencyLine(line) {
-
-  if (!line) {
-    return false;
-  }
-
-  const text = String(line).toLowerCase();
-
-  return (
-    text.includes("сум") ||
-    text.includes("сўм") ||
-    text.includes("сом") ||
-    /so['’‘`ʼʻ]?m/i.test(text)
-  );
-}
-
-
-// =====================================================
-// MUVAFFAQIYATLI CLICK TO'LOVNI TEKSHIRISH
-// =====================================================
-
-function isSuccessfulPayment(text) {
+function extractAmount(text) {
 
   if (!text) {
-    return false;
+    return null;
   }
 
   const normalized = String(text)
-    .replace(/\u00A0/g, " ")
-    .replace(/\u202F/g, " ")
-    .replace(/\r/g, "")
-    .trim();
+    .replace(/\u00a0/g, ' ')
+    .replace(/\r/g, '');
 
-  // Click xabarlaridagi muvaffaqiyat holatlari
-  return (
-    /успешно\s+подтвержден/i.test(normalized) ||
-    /успешно\s+подтверждён/i.test(normalized) ||
-    /успешно\s+подтверждено/i.test(normalized)
+  const lines = normalized
+    .split('\n')
+    .map(x => x.trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+
+    if (
+      !/(summa|сумма|amount|to.?lov|tolov|тўлов|төлов|mablag|маблаг)/iu
+        .test(line)
+    ) {
+      continue;
+    }
+
+    const match = line.match(
+      /(\d{1,3}(?:[\s.,]\d{3})+|\d{4,})\s*(?:so.?m|sum|сум|сўм|uzs)?/iu
+    );
+
+    if (match) {
+
+      const amount =
+        normalizeAmount(match[1]);
+
+      if (amount !== null) {
+        return amount;
+      }
+    }
+  }
+
+  const currencyMatch =
+    normalized.match(
+      /(\d{1,3}(?:[\s.,]\d{3})+|\d{4,})\s*(?:so.?m|sum|сум|сўм|uzs)\b/iu
+    );
+
+  return currencyMatch
+    ? normalizeAmount(currencyMatch[1])
+    : null;
+}
+
+function extractPhone(text) {
+
+  if (!text) {
+    return '';
+  }
+
+  const source = String(text)
+    .replace(/\u00a0/g, ' ');
+
+  const candidates =
+    source.match(
+      /(?:\+?998)[\s()\-\d]{9,}/g
+    ) || [];
+
+  for (const candidate of candidates) {
+
+    const phone =
+      normalizePhone(candidate);
+
+    if (
+      phone.length === 12 &&
+      phone.startsWith('998')
+    ) {
+      return phone;
+    }
+  }
+
+  const lines =
+    source
+      .split('\n')
+      .map(x => x.trim());
+
+  for (const line of lines) {
+
+    if (
+      !/(id|telefon|phone|номер|телефон)/iu
+        .test(line)
+    ) {
+      continue;
+    }
+
+    const match =
+      line.match(
+        /(?:\D|^)(\d{9})(?:\D|$)/
+      );
+
+    if (match) {
+      return `998${match[1]}`;
+    }
+  }
+
+  return '';
+}
+
+function hasSuccessfulStatus(text) {
+
+  if (!text) {
+    return false;
+  }
+
+  const s =
+    String(text).toLowerCase();
+
+  return [
+    'успешно подтвержден',
+    'успешно подтверждено',
+    'успешно подтверждена',
+    'muvaffaqiyatli tasdiqlandi',
+    'muvaffaqiyatli'
+  ].some(word =>
+    s.includes(word)
   );
 }
 
-
-// =====================================================
-// CLICK XABARINI TAHLIL QILISH
-// =====================================================
-
-function parseClickMessage(text) {
+function parseClickPayment(text) {
 
   if (!text) {
     return null;
   }
 
-  const rawText = String(text)
-    .replace(/\u00A0/g, " ")
-    .replace(/\u202F/g, " ")
-    .trim();
-
-  // -----------------------------------------------
-  // 1. MUVAFFAQIYATLI TO'LOV BO'LISHI SHART
-  // -----------------------------------------------
-
-  if (!isSuccessfulPayment(rawText)) {
+  if (!hasSuccessfulStatus(text)) {
     return null;
   }
 
+  const amount =
+    extractAmount(text);
 
-  // -----------------------------------------------
-  // 2. CLICK XABARIDA "PARAMETRLAR OPATЫ" BO'LISHI SHART
-  // -----------------------------------------------
-
-  if (
-    !/параметры\s+оплаты/i.test(rawText)
-  ) {
+  if (amount !== EXPECTED_AMOUNT) {
     return null;
   }
 
+  const phone =
+    extractPhone(text);
 
-  const lines = rawText
-    .split(/\r?\n/)
-    .map(line => line.trim())
-    .filter(Boolean);
-
-
-  // -----------------------------------------------
-  // 3. PARAMETRLAR QATORINI TOPISH
-  // -----------------------------------------------
-
-  const paramIdx = lines.findIndex(
-    line =>
-      /параметры\s+оплаты/i.test(line)
-  );
-
-
-  let ref = null;
-
-
-  // -----------------------------------------------
-  // 4. PARAMETRLARDAN TELEFON / ID TOPISH
-  // -----------------------------------------------
-
-  if (paramIdx !== -1) {
-
-    const possibleLines =
-      lines.slice(
-        paramIdx + 1,
-        paramIdx + 6
-      );
-
-    for (const line of possibleLines) {
-
-      // Telefon raqami bo'lsa
-      const phoneMatch =
-        line.match(
-          /\+?\d[\d\s().-]{7,}\d/
-        );
-
-      if (phoneMatch) {
-
-        ref = phoneMatch[0]
-          .trim();
-
-        break;
-      }
-
-
-      // Agar telefon ID ko'rinishida bo'lsa
-      const cleanDigits =
-        line.replace(
-          /[^0-9]/g,
-          ""
-        );
-
-      if (
-        cleanDigits.length >= 9 &&
-        cleanDigits.length <= 15
-      ) {
-
-        ref = cleanDigits;
-
-        break;
-      }
-    }
+  if (!phone) {
+    return null;
   }
-
-
-  // -----------------------------------------------
-  // 5. SUMMANI TOPISH
-  // -----------------------------------------------
-
-  let amount = null;
-  let amountLine = null;
-
-
-  for (const line of lines) {
-
-    if (!isCurrencyLine(line)) {
-      continue;
-    }
-
-
-    // Qatordagi raqamlarni olish
-    const numberMatches =
-      line.match(
-        /\d[\d\s.,]*/g
-      );
-
-
-    if (
-      !numberMatches ||
-      !numberMatches.length
-    ) {
-      continue;
-    }
-
-
-    // Currency qatoridagi birinchi raqam
-    for (const candidate of numberMatches) {
-
-      const detectedAmount =
-        normalizeAmount(candidate);
-
-      if (
-        detectedAmount !== null
-      ) {
-
-        amount =
-          detectedAmount;
-
-        amountLine =
-          line;
-
-        break;
-      }
-    }
-
-
-    if (amount !== null) {
-      break;
-    }
-  }
-
-
-  // -----------------------------------------------
-  // 6. NATIJA
-  // -----------------------------------------------
 
   return {
-    ref,
-    amount,
-    amountLine
+    phone,
+    amount: EXPECTED_AMOUNT,
+    currency: 'UZS'
   };
 }
 
-
-// =====================================================
-// TELEGRAM BOT
-// =====================================================
-
-let bot = null;
-
-if (!BOT_TOKEN) {
-
-  console.log(
-    "OGOHLANTIRISH: TELEGRAM_BOT_TOKEN topilmadi."
-  );
-
-} else {
-
-  bot = new TelegramBot(
-    BOT_TOKEN,
-    {
-      polling: {
-        autoStart: false
-      }
-    }
-  );
-
-
-  // -----------------------------------------------
-  // POLLING ERROR
-  // -----------------------------------------------
-
-  bot.on(
-    "polling_error",
-    error => {
-
-      console.log(
-        "Telegram polling error:",
-        error.message
-      );
-
-    }
-  );
-
-
-  // -----------------------------------------------
-  // TELEGRAM MESSAGE
-  // -----------------------------------------------
-
-  bot.on(
-    "message",
-    msg => {
-
-      try {
-
-        // -----------------------------------------
-        // FAQAT KERAKLI GURUH
-        // -----------------------------------------
-
-        if (
-          ALLOWED_CHAT_ID &&
-          String(msg.chat.id) !==
-            ALLOWED_CHAT_ID
-        ) {
-
-          return;
-        }
-
-
-        const text =
-          msg.text || "";
-
-
-        console.log("");
-        console.log(
-          "========================================"
-        );
-
-        console.log(
-          "YANGI TELEGRAM XABAR"
-        );
-
-        console.log(
-          "Chat ID:",
-          msg.chat.id
-        );
-
-        console.log(
-          "Chat title:",
-          msg.chat.title || ""
-        );
-
-        console.log(
-          "Xabar:",
-          text
-        );
-
-        console.log(
-          "========================================"
-        );
-
-
-        // -----------------------------------------
-        // CLICK XABARINI PARSE QILISH
-        // -----------------------------------------
-
-        const parsed =
-          parseClickMessage(text);
-
-
-        if (!parsed) {
-
-          console.log(
-            "❌ Click to'lovi sifatida qabul qilinmadi."
-          );
-
-          return;
-        }
-
-
-        console.log(
-          "Aniqlangan REF:",
-          parsed.ref
-        );
-
-        console.log(
-          "Aniqlangan summa:",
-          parsed.amount
-        );
-
-        console.log(
-          "Summa qatori:",
-          parsed.amountLine
-        );
-
-
-        // -----------------------------------------
-        // REF / TELEFON SHART
-        // -----------------------------------------
-
-        if (!parsed.ref) {
-
-          console.log(
-            "❌ Telefon/ref topilmadi."
-          );
-
-          return;
-        }
-
-
-        const phoneDigits =
-          parsed.ref.replace(
-            /[^0-9]/g,
-            ""
-          );
-
-
-        if (!phoneDigits) {
-
-          console.log(
-            "❌ Telefon raqami topilmadi."
-          );
-
-          return;
-        }
-
-
-        // -----------------------------------------
-        // ENG MUHIM TEKSHIRUV
-        //
-        // FAQAT 412 000 SO'M
-        // -----------------------------------------
-
-        if (
-          parsed.amount !==
-          EXPECTED_AMOUNT
-        ) {
-
-          console.log("");
-          console.log(
-            "❌ TO'LOV TASDIQLANMADI"
-          );
-
-          console.log(
-            "Kelgan summa:",
-            parsed.amount
-          );
-
-          console.log(
-            "Kerakli summa:",
-            EXPECTED_AMOUNT
-          );
-
-          console.log(
-            "Sabab: summa aynan 412 000 so'm emas."
-          );
-
-          console.log("");
-
-          return;
-        }
-
-
-        // -----------------------------------------
-        // DATABASE
-        // -----------------------------------------
-
-        const db =
-          loadDb();
-
-
-        // -----------------------------------------
-        // FAQAT 412 000 BO'LSA SAQLAYMIZ
-        // -----------------------------------------
-
-        db[phoneDigits] = {
-
-          status: "paid",
-
-          amount:
-            EXPECTED_AMOUNT,
-
-          paidAt:
-            new Date().toISOString(),
-
-          source:
-            "click-telegram"
-        };
-
-
-        const saved =
-          saveDb(db);
-
-
-        if (!saved) {
-
-          console.log(
-            "❌ To'lovni databasega saqlab bo'lmadi."
-          );
-
-          return;
-        }
-
-
-        // -----------------------------------------
-        // TASDIQLANGAN
-        // -----------------------------------------
-
-        console.log("");
-        console.log(
-          "========================================"
-        );
-
-        console.log(
-          "✅ TO'LOV TASDIQLANDI"
-        );
-
-        console.log(
-          "Telefon:",
-          phoneDigits
-        );
-
-        console.log(
-          "Summa:",
-          EXPECTED_AMOUNT
-        );
-
-        console.log(
-          "========================================"
-        );
-
-        console.log("");
-
-      } catch (error) {
-
-        console.log(
-          "❌ Xabarni qayta ishlashda xato:",
-          error.message
-        );
-      }
-    }
-  );
-
-
-  // -----------------------------------------------
-  // TELEGRAM POLLINGNI BOSHLASH
-  // -----------------------------------------------
-
-  bot.startPolling()
-    .then(() => {
-
-      console.log(
-        "Telegram bot polling ishga tushdi."
-      );
-
-    })
-    .catch(error => {
-
-      console.log(
-        "Telegram pollingni ishga tushirishda xato:",
-        error.message
-      );
-
-    });
+// ============================================================
+// TELEGRAM
+// ============================================================
+
+const bot = new TelegramBot(
+  BOT_TOKEN,
+  {
+    polling: false
+  }
+);
+
+function isAllowedChat(msg) {
+
+  return String(
+    msg?.chat?.id || ''
+  ) === ALLOWED_CHAT_ID;
 }
 
+function getMessageText(msg) {
 
-// =====================================================
-// STATUS API
-// =====================================================
-//
-// Test sayti:
-// /status/998901234567
-//
-// paid:true  -> 412 000 to'langan
-// paid:false -> to'lanmagan
-// =====================================================
+  return String(
+    msg?.text ||
+    msg?.caption ||
+    ''
+  ).trim();
+}
 
-app.get(
-  "/status/:phone",
+function paymentExistsByTelegramMessage(
+  db,
+  msg
+) {
+
+  return db.payments.some(p =>
+    p.chatId ===
+      String(msg.chat.id) &&
+    p.messageId ===
+      Number(msg.message_id)
+  );
+}
+
+function paymentExistsByPhone(
+  db,
+  phone
+) {
+
+  return db.payments.some(p =>
+    p.status === 'paid' &&
+    p.phone === phone &&
+    p.amount === EXPECTED_AMOUNT
+  );
+}
+
+function recordPayment(
+  msg,
+  payment
+) {
+
+  const db = loadDb();
+
+  if (
+    paymentExistsByTelegramMessage(
+      db,
+      msg
+    )
+  ) {
+
+    console.log(
+      'DUPLICATE: Telegram message already processed'
+    );
+
+    return false;
+  }
+
+  if (
+    paymentExistsByPhone(
+      db,
+      payment.phone
+    )
+  ) {
+
+    console.log(
+      'DUPLICATE: phone already has a paid record'
+    );
+
+    return false;
+  }
+
+  const record = {
+
+    id: crypto.randomUUID(),
+
+    phone:
+      payment.phone,
+
+    amount:
+      EXPECTED_AMOUNT,
+
+    currency:
+      'UZS',
+
+    status:
+      'paid',
+
+    consumed:
+      false,
+
+    chatId:
+      String(msg.chat.id),
+
+    chatTitle:
+      msg.chat.title ||
+      msg.chat.username ||
+      '',
+
+    messageId:
+      Number(msg.message_id),
+
+    createdAt:
+      new Date().toISOString(),
+
+    sourceText:
+      getMessageText(msg)
+
+  };
+
+  db.payments.push(record);
+
+  saveDb(db);
+
+  console.log(
+    '========================================'
+  );
+
+  console.log(
+    'PAYMENT VERIFIED'
+  );
+
+  console.log(
+    'PHONE:',
+    payment.phone
+  );
+
+  console.log(
+    'AMOUNT:',
+    EXPECTED_AMOUNT
+  );
+
+  console.log(
+    'MESSAGE ID:',
+    msg.message_id
+  );
+
+  console.log(
+    '========================================'
+  );
+
+  return true;
+}
+
+async function handleTelegramUpdate(
+  update
+) {
+
+  const msg =
+    update?.message;
+
+  if (!msg) {
+    return;
+  }
+
+  if (!isAllowedChat(msg)) {
+
+    console.log(
+      'Ignored message from chat:',
+      msg.chat?.id
+    );
+
+    return;
+  }
+
+  const text =
+    getMessageText(msg);
+
+  if (!text) {
+    return;
+  }
+
+  console.log(
+    'CLICK GROUP MESSAGE:',
+    text
+  );
+
+  const payment =
+    parseClickPayment(text);
+
+  if (!payment) {
+
+    console.log(
+      'Not a valid 412000 UZS successful payment.'
+    );
+
+    return;
+  }
+
+  try {
+
+    recordPayment(
+      msg,
+      payment
+    );
+
+  } catch (error) {
+
+    console.error(
+      'PAYMENT SAVE ERROR:',
+      error.message
+    );
+  }
+}
+
+// ============================================================
+// TELEGRAM WEBHOOK
+// ============================================================
+
+app.post(
+  WEBHOOK_PATH,
   (req, res) => {
 
-    res.set(
-      "Access-Control-Allow-Origin",
-      "*"
-    );
-
-    res.set(
-      "Access-Control-Allow-Headers",
-      "Content-Type"
-    );
-
-
-    const phone =
-      String(req.params.phone || "")
-        .replace(
-          /[^0-9]/g,
-          ""
-        );
-
-
-    if (!phone) {
-
-      return res.json({
-        paid: false,
-        amount: EXPECTED_AMOUNT
-      });
-    }
-
-
-    const db =
-      loadDb();
-
-
-    const record =
-      db[phone];
-
-
-    // FAQAT AYNAN 412000
-    const isPaid =
-      !!(
-        record &&
-        record.status === "paid" &&
-        Number(record.amount) ===
-          EXPECTED_AMOUNT
+    const incomingSecret =
+      String(
+        req.get(
+          'X-Telegram-Bot-Api-Secret-Token'
+        ) || ''
       );
 
+    if (
+      incomingSecret !==
+      WEBHOOK_SECRET
+    ) {
+      return res.sendStatus(401);
+    }
 
-    return res.json({
+    res.sendStatus(200);
 
-      paid:
-        isPaid,
+    handleTelegramUpdate(
+      req.body
+    ).catch(error => {
 
-      amount:
-        EXPECTED_AMOUNT
+      console.error(
+        'WEBHOOK UPDATE ERROR:',
+        error
+      );
 
     });
   }
 );
 
-
-// =====================================================
-// HOME
-// =====================================================
+// ============================================================
+// PAYMENT STATUS API
+// ============================================================
 
 app.get(
-  "/",
+  '/payment-status',
   (req, res) => {
 
-    res.send(
-      "Payment verification server ishlamoqda."
+    res.setHeader(
+      'Cache-Control',
+      'no-store, no-cache, must-revalidate, proxy-revalidate'
     );
+
+    res.setHeader(
+      'Pragma',
+      'no-cache'
+    );
+
+    res.setHeader(
+      'Expires',
+      '0'
+    );
+
+    try {
+
+      const phone =
+        normalizePhone(
+          req.query.phone
+        );
+
+      if (
+        !phone ||
+        phone.length !== 12 ||
+        !phone.startsWith('998')
+      ) {
+
+        return res.status(400).json({
+
+          paid: false,
+
+          amount: 0,
+
+          error:
+            'Telefon raqami noto‘g‘ri'
+
+        });
+      }
+
+      const db =
+        loadDb();
+
+      let index = -1;
+
+      for (
+        let i = db.payments.length - 1;
+        i >= 0;
+        i--
+      ) {
+
+        const p =
+          db.payments[i];
+
+        if (
+          p.status === 'paid' &&
+          p.amount === EXPECTED_AMOUNT &&
+          p.phone === phone &&
+          p.consumed !== true
+        ) {
+
+          index = i;
+
+          break;
+        }
+      }
+
+      if (index === -1) {
+
+        return res.json({
+
+          paid: false,
+
+          amount: 0,
+
+          expectedAmount:
+            EXPECTED_AMOUNT,
+
+          currency:
+            'UZS'
+
+        });
+      }
+
+      db.payments[index]
+        .consumed = true;
+
+      db.payments[index]
+        .consumedAt =
+        new Date().toISOString();
+
+      saveDb(db);
+
+      return res.json({
+
+        paid: true,
+
+        amount:
+          EXPECTED_AMOUNT,
+
+        currency:
+          'UZS',
+
+        ref:
+          phone
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        'PAYMENT STATUS ERROR:',
+        error.message
+      );
+
+      return res.status(500).json({
+
+        paid: false,
+
+        amount: 0,
+
+        error:
+          'Server xatosi'
+
+      });
+    }
   }
 );
 
-
-// =====================================================
-// HEALTH CHECK
-// =====================================================
+// ============================================================
+// HEALTH
+// ============================================================
 
 app.get(
-  "/health",
+  '/',
   (req, res) => {
 
     res.json({
+
       ok: true,
+
+      service:
+        'click-payment-gate',
+
       expectedAmount:
-        EXPECTED_AMOUNT
+        EXPECTED_AMOUNT,
+
+      currency:
+        'UZS'
+
     });
   }
 );
 
+app.get(
+  '/health',
+  (req, res) => {
 
-// =====================================================
-// SERVER
-// =====================================================
+    res.json({
+
+      ok: true,
+
+      webhook: true,
+
+      expectedAmount:
+        EXPECTED_AMOUNT
+
+    });
+  }
+);
+
+// ============================================================
+// WEBHOOK SETUP
+// ============================================================
+
+async function configureWebhook() {
+
+  const webhookUrl =
+    `${PUBLIC_URL}${WEBHOOK_PATH}`;
+
+  console.log(
+    'Configuring Telegram webhook:',
+    webhookUrl
+  );
+
+  await bot.setWebHook(
+    webhookUrl,
+    {
+      secret_token:
+        WEBHOOK_SECRET,
+
+      drop_pending_updates:
+        false
+    }
+  );
+
+  const info =
+    await bot.getWebhookInfo();
+
+  console.log(
+    'Telegram webhook URL:',
+    info.url || '(empty)'
+  );
+
+  console.log(
+    'Telegram pending updates:',
+    info.pending_update_count || 0
+  );
+
+  if (
+    info.last_error_message
+  ) {
+
+    console.log(
+      'Telegram webhook last error:',
+      info.last_error_message
+    );
+  }
+}
+
+// ============================================================
+// START
+// ============================================================
 
 app.listen(
   PORT,
-  () => {
+  async () => {
 
-    console.log("");
     console.log(
-      "========================================"
+      '========================================'
     );
 
     console.log(
-      "✅ SERVER ISHLADI"
+      'CLICK PAYMENT SERVER STARTED'
     );
 
     console.log(
-      "Kerakli summa: 412000 so'm"
-    );
-
-    console.log(
-      "Faqat aynan 412000 qabul qilinadi."
-    );
-
-    console.log(
-      "PORT:",
+      'PORT:',
       PORT
     );
 
     console.log(
-      "========================================"
+      'EXPECTED AMOUNT:',
+      EXPECTED_AMOUNT
     );
+
+    console.log(
+      'ALLOWED CHAT:',
+      ALLOWED_CHAT_ID
+    );
+
+    console.log(
+      'PUBLIC URL:',
+      PUBLIC_URL
+    );
+
+    console.log(
+      'WEBHOOK:',
+      `${PUBLIC_URL}${WEBHOOK_PATH}`
+    );
+
+    console.log(
+      '========================================'
+    );
+
+    try {
+
+      await configureWebhook();
+
+      console.log(
+        'TELEGRAM WEBHOOK: READY'
+      );
+
+    } catch (error) {
+
+      console.error(
+        'TELEGRAM WEBHOOK SETUP ERROR:',
+        error.message
+      );
+    }
   }
 );
