@@ -1,7 +1,12 @@
-// Germaniya viza testi — to'liq backend.
+// Germaniya viza testi — to'liq backend (to'liq avtomatik, admin kerak emas).
 // 1) Telegram guruhdagi Click bildirishnomalarini o'qib, to'lovni avtomatik tasdiqlaydi
+//    (faqat aynan 412 000 so'm va undan yuqori summa "to'landi" deb hisoblanadi —
+//    Click sahifasida ko'rsatilgan summaga emas, guruhga kelgan HAQIQIY tasdiqlangan
+//    summaga ishoniladi, shuning uchun buni chetlab o'tib bo'lmaydi)
 // 2) Test sahifasi (istalgan joyda joylashtirilgan — Netlify, va h.k.) uchun
-//    oferta rozilik, test natijalari va admin panelni saqlaydi
+//    oferta rozilik va test natijalarini saqlaydi
+// 3) Har bir TO'LOV QILGAN mijoz uchun (ism, telefon, oferta roziligi, to'lov,
+//    keyin test natijasi) yuridik hisobot guruhiga avtomatik xabar yuboradi
 
 const express = require('express');
 const fs = require('fs');
@@ -10,8 +15,9 @@ const TelegramBot = require('node-telegram-bot-api');
 
 // ==== SOZLAMALAR ====
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || 'PUT_YOUR_BOT_TOKEN_HERE';
-const ALLOWED_CHAT_ID = process.env.CLICK_GROUP_CHAT_ID || '';
-const EXPECTED_AMOUNT = 412000; // so'mda, test narxi
+const ALLOWED_CHAT_ID = process.env.CLICK_GROUP_CHAT_ID || ''; // Click bildirishnomalari guruhi
+const LEGAL_GROUP_CHAT_ID = process.env.LEGAL_GROUP_CHAT_ID || ''; // Yuridik hisobot guruhi
+const EXPECTED_AMOUNT = 412000; // so'mda, test narxi — bundan kam to'lov hech qachon qabul qilinmaydi
 
 // ---- Oddiy fayl-baza yordamchilari ----
 function dbPath(name) { return path.join(__dirname, name + '.json'); }
@@ -27,10 +33,6 @@ function saveJson(name, data) {
 function loadPayments() { return loadJson('payments', {}); }
 function savePayments(db) { saveJson('payments', db); }
 
-// pending: { "<phoneDigits>": { name, phone, amount, receiptId, timestamp, status:'pending'|'approved'|'rejected' } }
-function loadPending() { return loadJson('pending', {}); }
-function savePending(db) { saveJson('pending', db); }
-
 // consents: [ {name, phone, timestamp} ]
 function loadConsents() { return loadJson('consents', []); }
 function saveConsents(list) { saveJson('consents', list); }
@@ -40,6 +42,51 @@ function loadSubmissions() { return loadJson('submissions', []); }
 function saveSubmissions(list) { saveJson('submissions', list); }
 
 function digits(s) { return (s || '').replace(/[^0-9]/g, ''); }
+
+function findLatestConsent(phoneDigits) {
+  const list = loadConsents();
+  const matches = list.filter(c => digits(c.phone) === phoneDigits);
+  return matches.length ? matches[matches.length - 1] : null;
+}
+
+// ---- Telegram bot ----
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+bot.on('polling_error', (err) => console.error('TELEGRAM POLLING ERROR:', err.code, err.message));
+bot.getMe().then(me => console.log('BOT ULANDI:', me.username)).catch(err => console.error('BOT TOKEN XATOLIGI:', err.message));
+
+function sendLegalNotice(text) {
+  if (!LEGAL_GROUP_CHAT_ID) { console.log('LEGAL_GROUP_CHAT_ID sozlanmagan, xabar yuborilmadi.'); return; }
+  bot.sendMessage(LEGAL_GROUP_CHAT_ID, text).catch(err => console.error('Legal guruhga yuborishda xatolik:', err.message));
+}
+
+function notifyPaymentConfirmed(phoneDigits, amount) {
+  const consent = findLatestConsent(phoneDigits);
+  const lines = [
+    '🧾 YANGI TO\'LOV TASDIQLANDI',
+    '',
+    `Ism: ${consent ? consent.name : '(oferta yozuvi topilmadi)'}`,
+    `Telefon: +${phoneDigits}`,
+    `Summa: ${amount.toLocaleString()} so'm`,
+    consent ? `Oferta roziligi: ${new Date(consent.timestamp).toLocaleString('uz-UZ')} da tasdiqlangan` : 'Oferta roziligi: TOPILMADI (tekshiring)',
+    `To'lov vaqti: ${new Date().toLocaleString('uz-UZ')}`,
+  ];
+  sendLegalNotice(lines.join('\n'));
+}
+
+function notifySubmission(record) {
+  const lines = [
+    '📋 TEST NATIJASI',
+    '',
+    `Ism: ${record.name}`,
+    `Telefon: ${record.phone}`,
+    `Yo'nalish: ${record.direction === 'rus' ? 'Rus tili' : 'Nemis tili'}`,
+    `Soha: ${record.sector} — ${record.specialty}`,
+    `Til balli: ${record.lang.correct}/${record.lang.total}`,
+    `Kasb balli: ${record.prof.correct}/${record.prof.total}`,
+    `Natija: ${record.passed ? 'O\'TDI ✅' : 'O\'TMADI ❌'}`,
+  ];
+  sendLegalNotice(lines.join('\n'));
+}
 
 // ---- Click guruh xabarini tahlil qilish ----
 function parseClickMessage(text) {
@@ -59,9 +106,6 @@ function parseClickMessage(text) {
   return { ref, amount };
 }
 
-// ---- Telegram bot: guruh xabarlarini tinglaydi ----
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
 bot.on('message', (msg) => {
   if (ALLOWED_CHAT_ID && String(msg.chat.id) !== String(ALLOWED_CHAT_ID)) return;
   console.log('Xabar keldi. chat.id =', msg.chat.id, '| chat.title =', msg.chat.title);
@@ -71,22 +115,24 @@ bot.on('message', (msg) => {
 
   const phoneDigits = digits(parsed.ref);
   if (!phoneDigits) return;
+
+  // QAT'IY SUMMA TEKSHIRUVI: Click sahifasida ko'rsatilgan summaga emas,
+  // shu yerga — guruhga kelgan HAQIQIY tasdiqlangan summaga ishonamiz.
   if (parsed.amount == null || parsed.amount < EXPECTED_AMOUNT) {
-    console.log('CLICK PAYMENT IGNORED (amount mismatch):', parsed);
+    console.log('CLICK PAYMENT IGNORED (summa yetarli emas):', parsed);
     return;
   }
 
   console.log('CLICK PAYMENT FOUND:', { ref: phoneDigits, amount: parsed.amount });
 
   const payments = loadPayments();
+  const alreadyPaid = payments[phoneDigits] && payments[phoneDigits].status === 'paid';
   payments[phoneDigits] = { status: 'paid', amount: parsed.amount, paidAt: new Date().toISOString() };
   savePayments(payments);
 
-  // pending yozuvi bo'lsa, uni ham yopamiz (tarix uchun)
-  const pending = loadPending();
-  if (pending[phoneDigits]) { pending[phoneDigits].status = 'approved'; savePending(pending); }
-
   console.log('PAYMENT CONFIRMED:', phoneDigits, '|', parsed.amount, "so'm");
+
+  if (!alreadyPaid) notifyPaymentConfirmed(phoneDigits, parsed.amount);
 });
 
 // ==== HTTP API ====
@@ -97,7 +143,7 @@ app.options('*', (req, res) => res.sendStatus(200));
 
 app.get('/', (req, res) => res.send('Bot ishlamoqda.'));
 
-// ---- To'lov holati (asosiy, avtomatik) ----
+// ---- To'lov holati (yagona manba — to'liq avtomatik) ----
 app.get('/status/:phone', (req, res) => {
   const payments = loadPayments();
   const rec = payments[digits(req.params.phone)];
@@ -114,54 +160,16 @@ app.post('/api/consent', (req, res) => {
   res.json({ ok: true });
 });
 
-// ---- "To'lov qildim" — kutish navbatiga qo'shish (admin zaxira tasdig'i uchun) ----
-app.post('/api/pending', (req, res) => {
-  const { name, phone, amount, receiptId } = req.body || {};
-  if (!name || !phone) return res.status(400).json({ ok: false, error: 'name/phone required' });
-  const pending = loadPending();
-  pending[digits(phone)] = { name, phone, amount: amount || EXPECTED_AMOUNT, receiptId: receiptId || '', timestamp: new Date().toISOString(), status: 'pending' };
-  savePending(pending);
-  res.json({ ok: true });
-});
-
-// ---- Admin: kutilayotgan to'lovlar ro'yxati ----
-app.get('/api/pending', (req, res) => {
-  const pending = loadPending();
-  const list = Object.values(pending).filter(p => p.status === 'pending');
-  res.json({ pending: list });
-});
-
-// ---- Admin: to'lovni qo'lda tasdiqlash/rad etish ----
-app.post('/api/pending/:phone/resolve', (req, res) => {
-  const { status, reason } = req.body || {}; // 'approved' | 'rejected'
-  const key = digits(req.params.phone);
-  const pending = loadPending();
-  if (!pending[key]) return res.status(404).json({ ok: false, error: 'not found' });
-  pending[key].status = status;
-  pending[key].reason = reason || '';
-  savePending(pending);
-
-  if (status === 'approved') {
-    const payments = loadPayments();
-    payments[key] = { status: 'paid', amount: pending[key].amount, paidAt: new Date().toISOString() };
-    savePayments(payments);
-  }
-  res.json({ ok: true });
-});
-
 // ---- Test natijasi ----
 app.post('/api/submission', (req, res) => {
   const record = req.body || {};
   if (!record.name || !record.phone) return res.status(400).json({ ok: false, error: 'name/phone required' });
+  const full = { ...record, timestamp: new Date().toISOString() };
   const list = loadSubmissions();
-  list.push({ ...record, timestamp: new Date().toISOString() });
+  list.push(full);
   saveSubmissions(list);
+  notifySubmission(full);
   res.json({ ok: true });
-});
-
-// ---- Admin: barcha test natijalari ----
-app.get('/api/submissions', (req, res) => {
-  res.json({ submissions: loadSubmissions().slice().reverse() });
 });
 
 const PORT = process.env.PORT || 3000;
