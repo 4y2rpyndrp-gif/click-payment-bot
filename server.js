@@ -107,8 +107,8 @@ function parseClickMessage(text) {
 }
 
 bot.on('message', (msg) => {
-  if (ALLOWED_CHAT_ID && String(msg.chat.id) !== String(ALLOWED_CHAT_ID)) return;
   console.log('Xabar keldi. chat.id =', msg.chat.id, '| chat.title =', msg.chat.title);
+  if (ALLOWED_CHAT_ID && String(msg.chat.id) !== String(ALLOWED_CHAT_ID)) return;
 
   const parsed = parseClickMessage(msg.text || '');
   if (!parsed || !parsed.ref) return;
