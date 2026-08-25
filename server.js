@@ -150,6 +150,36 @@ app.get('/status/:phone', (req, res) => {
   res.json({ paid: !!(rec && rec.status === 'paid') });
 });
 
+// ---- To'lovni "ishlatilgan" deb belgilash — shu telefon raqami endi bepul qayta test topshira olmaydi ----
+app.post('/api/consume-payment', (req, res) => {
+  const key = digits((req.body || {}).phone);
+  if (!key) return res.status(400).json({ ok: false, error: 'phone kerak' });
+  const payments = loadPayments();
+  if (payments[key] && payments[key].status === 'paid') {
+    payments[key].status = 'used';
+    payments[key].usedAt = new Date().toISOString();
+    savePayments(payments);
+  }
+  res.json({ ok: true });
+});
+
+// ---- Qo'lda tuzatish: bot avtomatik aniqlay olmagan haqiqiy to'lovni belgilash ----
+// Faqat ADMIN_SECRET ni bilgan kishi ishlata oladi.
+app.post('/api/mark-paid', (req, res) => {
+  const { phone, amount, secret } = req.body || {};
+  if (!process.env.ADMIN_SECRET || secret !== process.env.ADMIN_SECRET) {
+    return res.status(403).json({ ok: false, error: 'Ruxsat yo\'q' });
+  }
+  const key = digits(phone);
+  if (!key) return res.status(400).json({ ok: false, error: 'phone kerak' });
+  const payments = loadPayments();
+  const alreadyPaid = payments[key] && payments[key].status === 'paid';
+  payments[key] = { status: 'paid', amount: amount || EXPECTED_AMOUNT, paidAt: new Date().toISOString() };
+  savePayments(payments);
+  if (!alreadyPaid) notifyPaymentConfirmed(key, amount || EXPECTED_AMOUNT);
+  res.json({ ok: true });
+});
+
 // ---- Oferta roziligi ----
 app.post('/api/consent', (req, res) => {
   const { name, phone } = req.body || {};
