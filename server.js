@@ -12,6 +12,7 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const TelegramBot = require('node-telegram-bot-api');
+const crypto = require('crypto');
 
 // ==== SOZLAMALAR ====
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || 'PUT_YOUR_BOT_TOKEN_HERE';
@@ -40,6 +41,10 @@ function saveConsents(list) { saveJson('consents', list); }
 // submissions: [ {name, phone, direction, sector, specialty, lang, prof, passed, timestamp} ]
 function loadSubmissions() { return loadJson('submissions', []); }
 function saveSubmissions(list) { saveJson('submissions', list); }
+
+// test_tokens: { "<token>": {phone, name, used, createdAt, usedAt} }
+function loadTestTokens() { return loadJson('test_tokens', {}); }
+function saveTestTokens(db) { saveJson('test_tokens', db); }
 
 function digits(s) { return (s || '').replace(/[^0-9]/g, ''); }
 
@@ -200,6 +205,32 @@ app.post('/api/submission', (req, res) => {
   saveSubmissions(list);
   notifySubmission(full);
   res.json({ ok: true });
+});
+
+// ---- Bir martalik test token yaratish (to'lov tasdiqlangandan keyin chaqiriladi) ----
+app.post('/api/issue-test-token', (req, res) => {
+  const { phone, name } = req.body || {};
+  if (!phone || !name) return res.status(400).json({ ok: false, error: 'phone/name required' });
+  const token = crypto.randomUUID();
+  const tokens = loadTestTokens();
+  tokens[token] = { phone, name, used: false, createdAt: new Date().toISOString() };
+  saveTestTokens(tokens);
+  res.json({ token });
+});
+
+// ---- Bir martalik test tokenni ishlatish (atomik: tekshirish+belgilash bitta
+//      sinxron blokda bajariladi, shuning uchun bir vaqtda ikki so'rov kelsa
+//      ham faqat bittasi muvaffaqiyatli bo'ladi) ----
+app.post('/api/consume-test-token', (req, res) => {
+  const { token } = req.body || {};
+  if (!token) return res.status(400).json({ ok: false });
+  const tokens = loadTestTokens();
+  const rec = tokens[token];
+  if (!rec || rec.used) return res.json({ ok: false });
+  rec.used = true;
+  rec.usedAt = new Date().toISOString();
+  saveTestTokens(tokens);
+  res.json({ ok: true, name: rec.name, phone: rec.phone });
 });
 
 const PORT = process.env.PORT || 3000;
